@@ -1,0 +1,1577 @@
+/**
+ * ESP32-S3  ->  VEGA ARIES v2  |  UNIFIED FIRMWARE RECEIVER + OFFICIAL FLASHER
+ * PHASE 1 (Wi-Fi): WiFiManager Captive Portal ("VEGA-PROGRAMMER") -> WebServer port 80
+ *   POST /upload  - receive application .bin from browser/website into LittleFS
+ *   GET  /status  - board info, LittleFS usage, stored firmware checksum
+ *
+ * PHASE 2 (USB Host): When VEGA FT230X is detected on USB Host AND .bin exists
+ *   in LittleFS -> auto-flash external SPI Flash via official VEGA FLASHER sequence.
+ *
+ * JUMPER NOTE:
+ *   J12 SHORTED (jumper ON) -> Permanent SPI Flash Boot / Flasher Mode
+ *   Requires manual VEGA RESET button press by user.
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <WebServer.h>
+#include <FS.h>
+#include <LittleFS.h>
+#include <mbedtls/sha256.h>
+#include "EspUsbHost.h"
+
+
+//  CONFIGURATION
+
+const char* PORTAL_AP_SSID     = "VEGA-PROGRAMMER";
+const char* FIRMWARE_FILE_PATH = "/VEGA_ARIES_v2_TEST.bin";
+
+//  WIFIMANAGER CUSTOM STYLING (VEGA ARISE EDU Embedded Portal Theme)
+
+//  WIFIMANAGER CUSTOM STYLING — VEGA ARISE EDU / ARIES V2 (Redesigned)
+const char custom_head_html[] PROGMEM =
+  "<style>"
+  // ---- CSS variables / reset
+  ":root{"
+    "--bg:#07101f;"
+    "--surface:#0f1e35;"
+    "--surface2:#162542;"
+    "--border:#1e3354;"
+    "--primary:#0ea5e9;"
+    "--primary-dim:#0284c7;"
+    "--accent:#38bdf8;"
+    "--green:#22c55e;"
+    "--text:#f0f6ff;"
+    "--text-sub:#8ba5c8;"
+    "--btn-grad:linear-gradient(135deg,#0ea5e9 0%,#2563eb 100%);"
+    "--shadow:0 20px 60px rgba(0,0,0,0.7);"
+  "}"
+  "*{box-sizing:border-box;margin:0;padding:0;}"
+  "html,body{min-height:100vh;}"
+  "body{"
+    "background:radial-gradient(ellipse 120% 80% at 50% -10%,#1e3a5f 0%,#07101f 55%);"
+    "color:var(--text);"
+    "font-family:'Segoe UI',system-ui,-apple-system,Roboto,Helvetica,sans-serif;"
+    "display:flex;justify-content:center;align-items:flex-start;"
+    "padding:32px 16px 48px;"
+  "}"
+  // ---- main wrapper
+  "div.wrap,div#content,div.c{max-width:460px;width:100%;margin:0 auto;}"
+  // ---- header block
+  ".header-block{"
+    "text-align:center;"
+    "margin-bottom:24px;"
+    "padding:28px 24px 20px;"
+    "background:rgba(14,165,233,0.07);"
+    "border:1px solid rgba(14,165,233,0.18);"
+    "border-radius:20px;"
+    "backdrop-filter:blur(8px);"
+  "}"
+  ".brand-badge{"
+    "display:inline-block;"
+    "background:rgba(14,165,233,0.15);"
+    "border:1px solid rgba(56,189,248,0.35);"
+    "color:#38bdf8;"
+    "font-size:0.7rem;"
+    "font-weight:800;"
+    "letter-spacing:2px;"
+    "text-transform:uppercase;"
+    "padding:4px 14px;"
+    "border-radius:30px;"
+    "margin-bottom:12px;"
+  "}"
+  "h1{"
+    "font-size:1.5rem;"
+    "font-weight:800;"
+    "color:#f0f6ff;"
+    "letter-spacing:0.3px;"
+    "margin-bottom:6px;"
+    "line-height:1.25;"
+  "}"
+  "h2{"
+    "font-size:0.85rem;"
+    "font-weight:500;"
+    "color:var(--text-sub);"
+    "line-height:1.5;"
+    "margin-bottom:0;"
+  "}"
+  // ---- section heading inside form
+  "h3{"
+    "font-size:0.75rem;"
+    "font-weight:700;"
+    "text-transform:uppercase;"
+  ".vega-chip-dot{width:6px;height:6px;border-radius:50%;background:#22d3a5;box-shadow:0 0 6px #22d3a5;}"
+  "h1.vega-title{font-size:1.5rem;font-weight:800;color:var(--text);letter-spacing:-0.3px;line-height:1.2;margin-bottom:4px;}"
+  ".vega-subtitle{font-size:0.82rem;color:var(--text-muted);font-weight:500;margin-bottom:0;}"
+  /* ── Main card ── */
+  ".wm-card{"
+    "background:var(--card);"
+    "border:1px solid var(--card-border);"
+    "border-top:none;"
+    "border-radius:0 0 20px 20px;"
+    "padding:28px 28px 32px;"
+    "box-shadow:0 20px 60px rgba(0,0,0,0.6);"
+    "margin-bottom:20px;"
+  "}"
+  /* ── WiFiManager overrides for main form ── */
+  "form{"
+    "background:transparent;"
+    "border:none;"
+    "border-radius:0;"
+    "padding:0;"
+    "box-shadow:none;"
+  "}"
+  /* ── Section label ── */
+  ".wm-section-label{"
+    "font-size:0.68rem;font-weight:700;"
+    "color:var(--text-dim);"
+    "text-transform:uppercase;letter-spacing:1.5px;"
+    "margin-bottom:10px;"
+    "display:flex;align-items:center;gap:8px;"
+  "}"
+  ".wm-section-label::after{content:'';flex:1;height:1px;background:var(--card-border);}"
+  /* ── Wi-Fi network list ── */
+  ".wifis-wrap{margin-bottom:22px;}"
+  "div.wifis{display:flex;flex-direction:column;gap:8px;}"
+  /* WiFiManager individual network row */
+  "div.wifis div,div.wifis label{"
+    "display:flex;align-items:center;"
+    "background:#0a1422;"
+    "border:1.5px solid var(--card-border);"
+    "border-radius:12px;"
+    "padding:13px 16px;"
+    "cursor:pointer;"
+    "transition:border-color 0.18s,background 0.18s,box-shadow 0.18s;"
+    "gap:14px;"
+    "min-height:58px;"
+  "}"
+  "div.wifis div:hover,div.wifis label:hover{"
+    "border-color:var(--accent);"
+    "background:#0e1c30;"
+    "box-shadow:0 0 0 3px var(--accent-glow);"
+  "}"
+  /* SSID name */
+  "div.wifis b{font-size:0.95rem;font-weight:600;color:var(--text);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
+  /* Signal indicator */
+  "div.wifis .rssi-bar{display:flex;align-items:flex-end;gap:2px;flex-shrink:0;}"
+  "div.wifis .rssi-bar span{display:block;width:4px;border-radius:2px;background:var(--card-border);}"
+  "div.wifis .rssi-bar span.on{background:var(--accent);}"
+  "div.wifis .rssi-bar span:nth-child(1){height:6px;}"
+  "div.wifis .rssi-bar span:nth-child(2){height:10px;}"
+  "div.wifis .rssi-bar span:nth-child(3){height:14px;}"
+  "div.wifis .rssi-bar span:nth-child(4){height:18px;}"
+  /* Lock icon */
+  "div.wifis .lock-icon{font-size:0.75rem;color:var(--text-dim);flex-shrink:0;}"
+  "div.wifis input[type='radio']{accent-color:var(--accent);width:16px;height:16px;flex-shrink:0;}"
+  /* ── Inputs ── */
+  "label{"
+    "display:block;"
+    "font-size:0.72rem;font-weight:700;"
+    "color:var(--text-muted);"
+    "text-transform:uppercase;letter-spacing:0.8px;"
+    "margin-bottom:7px;"
+  "}"
+  "input[type='text'],input[type='password']{"
+    "width:100%;"
+    "padding:13px 16px;"
+    "margin-bottom:20px;"
+    "background:#070e1a;"
+    "border:1.5px solid var(--card-border);"
+    "border-radius:11px;"
+    "color:var(--text);"
+    "font-size:0.95rem;font-family:inherit;"
+    "outline:none;"
+    "transition:border-color 0.18s,box-shadow 0.18s;"
+  "}"
+  "input[type='text']:focus,input[type='password']:focus{"
+    "border-color:var(--accent);"
+    "box-shadow:0 0 0 3px var(--accent-glow);"
+  "}"
+  "select{"
+    "width:100%;padding:13px 16px;margin-bottom:20px;"
+    "background:#070e1a;border:1.5px solid var(--card-border);border-radius:11px;"
+    "color:var(--text);font-size:0.95rem;font-family:inherit;"
+    "outline:none;transition:border-color 0.18s;"
+  "}"
+  "select:focus{border-color:var(--accent);}"
+  /* ── Submit button ── */
+  "button,input[type='submit']{"
+    "width:100%;padding:15px;"
+    "background:var(--btn-grad);"
+    "color:#fff;border:none;"
+    "border-radius:12px;"
+    "font-size:0.95rem;font-weight:700;font-family:inherit;"
+    "cursor:pointer;"
+    "letter-spacing:0.6px;text-transform:uppercase;"
+    "transition:transform 0.12s,box-shadow 0.18s,opacity 0.18s;"
+    "box-shadow:0 4px 20px rgba(14,165,233,0.35);"
+    "margin-top:4px;"
+  "}"
+  "button:hover,input[type='submit']:hover{"
+    "box-shadow:0 6px 28px rgba(14,165,233,0.5);"
+    "opacity:0.96;"
+  "}"
+  "button:active,input[type='submit']:active{transform:scale(0.97);}"
+  /* ── WiFiManager misc ── */
+  "div.msg{background:rgba(14,165,233,0.08);border:1px solid rgba(56,189,248,0.2);border-radius:10px;padding:12px 16px;margin-bottom:18px;font-size:0.85rem;color:var(--text-muted);}"
+  "div.q{margin-top:16px;font-size:0.82rem;text-align:center;color:var(--text-muted);}"
+  "div.q a{color:var(--accent);text-decoration:none;font-weight:600;}"
+  "div.q a:hover{text-decoration:underline;}"
+  ".status-tag{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:14px;font-size:0.78rem;color:var(--success);font-weight:600;}"
+  ".status-dot{width:8px;height:8px;background:var(--success);border-radius:50%;box-shadow:0 0 8px var(--success);animation:pulse 2s infinite;}"
+  "@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.4;}}"
+  /* ── Footer note ── */
+  ".wm-footer{text-align:center;font-size:0.72rem;color:var(--text-dim);margin-top:10px;}"
+  "</style>"
+  // Inline JS: wrap WiFiManager's generated network list in a cleaner container
+  "<script>"
+  "document.addEventListener('DOMContentLoaded',function(){"
+    // Wrap network list if present
+    "var wifis=document.querySelector('div.wifis');"
+    "if(wifis){"
+      "var wrap=document.createElement('div');"
+      "wrap.className='wifis-wrap';"
+      "var lbl=document.createElement('div');"
+      "lbl.className='wm-section-label';"
+      "lbl.textContent='Available Networks';"
+      "wifis.parentNode.insertBefore(wrap,wifis);"
+      "wrap.appendChild(lbl);"
+      "wrap.appendChild(wifis);"
+    "}"
+    // Add header branding above the form
+    "var form=document.querySelector('form');"
+    "var content=document.querySelector('#content,div.c');"
+    "if(form&&content){"
+      "var hdr=document.createElement('div');"
+      "hdr.className='vega-header';"
+      "hdr.innerHTML="
+        "'<div class=\'vega-logo-ring\'>'"
+        "+'<svg viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'#38bdf8\' stroke-width=\'2\' stroke-linecap=\'round\' stroke-linejoin=\'round\'>'"
+        "+'<polyline points=\'22 12 18 12 15 21 9 3 6 12 2 12\'></polyline></svg></div>'"
+        "+'<div class=\'vega-chip\'><span class=\'vega-chip-dot\'></span>Wi-Fi Setup</div>'"
+        "+'<h1 class=\'vega-title\'>VEGA ARISE EDU</h1>'"
+        "+'<div class=\'vega-subtitle\'>ARIES V2 Programmer &mdash; Wi-Fi Configuration</div>';"
+      "var card=document.createElement('div');"
+      "card.className='wm-card';"
+      "form.parentNode.insertBefore(hdr,form);"
+      "form.parentNode.insertBefore(card,form);"
+      "card.appendChild(form);"
+      "var footer=document.createElement('div');"
+      "footer.className='wm-footer';"
+      "footer.textContent='VEGA ARISE EDU © IIT Madras';"
+      "card.appendChild(footer);"
+    "}"
+  "});"
+  "</script>";
+
+//  XMODEM CONSTANTS
+#define XMODEM_BLOCK_SIZE 128
+#define XMODEM_SOH  0x01
+#define XMODEM_EOT  0x04
+#define XMODEM_ACK  0x06
+#define XMODEM_NAK  0x15
+#define XMODEM_CAN  0x18
+#define XMODEM_PAD  0x1A
+
+//  EMBEDDED OFFICIAL VEGA FLASHER BINARY (flasher.bin)
+// Compiled from official VEGA FLASHER source package (thejas32_arduino_flasher)
+const uint8_t flasher_min_bin[4532] PROGMEM = {
+  0x93, 0x00, 0x00, 0x00, 0x13, 0x01, 0x00, 0x00, 0x93, 0x01, 0x00, 0x00, 0x13, 0x02, 0x00, 0x00,
+  0x93, 0x02, 0x00, 0x00, 0x13, 0x03, 0x00, 0x00, 0x93, 0x03, 0x00, 0x00, 0x13, 0x04, 0x00, 0x00,
+  0x93, 0x04, 0x00, 0x00, 0x13, 0x05, 0x00, 0x00, 0x93, 0x05, 0x00, 0x00, 0x13, 0x06, 0x00, 0x00,
+  0x93, 0x06, 0x00, 0x00, 0x13, 0x07, 0x00, 0x00, 0x93, 0x07, 0x00, 0x00, 0x13, 0x08, 0x00, 0x00,
+  0x93, 0x08, 0x00, 0x00, 0x13, 0x09, 0x00, 0x00, 0x93, 0x09, 0x00, 0x00, 0x13, 0x0A, 0x00, 0x00,
+  0x93, 0x0A, 0x00, 0x00, 0x13, 0x0B, 0x00, 0x00, 0x93, 0x0B, 0x00, 0x00, 0x13, 0x0C, 0x00, 0x00,
+  0x93, 0x0C, 0x00, 0x00, 0x13, 0x0D, 0x00, 0x00, 0x93, 0x0D, 0x00, 0x00, 0x13, 0x0E, 0x00, 0x00,
+  0x93, 0x0E, 0x00, 0x00, 0x13, 0x0F, 0x00, 0x00, 0x93, 0x0F, 0x00, 0x00, 0x93, 0x02, 0x10, 0x00,
+  0x93, 0x92, 0xF2, 0x01, 0x63, 0xC4, 0x02, 0x00, 0x6F, 0x00, 0x00, 0x00, 0x97, 0x02, 0x00, 0x00,
+  0x93, 0x82, 0x02, 0x08, 0x73, 0x90, 0x52, 0x30, 0x97, 0x21, 0x00, 0x00, 0x93, 0x81, 0xC1, 0x91,
+  0x13, 0x82, 0x01, 0xAF, 0x13, 0x72, 0x02, 0xFC, 0x93, 0x06, 0x10, 0x00, 0x93, 0x85, 0x41, 0x81,
+  0x23, 0xA0, 0xD5, 0x00, 0x73, 0x25, 0x40, 0xF1, 0x63, 0x0E, 0x05, 0x02, 0x93, 0x05, 0x10, 0x00,
+  0x63, 0x70, 0xB5, 0x00, 0x93, 0x06, 0x10, 0x00, 0x93, 0x85, 0x41, 0x81, 0x03, 0xA6, 0x05, 0x00,
+  0xE3, 0x0C, 0xD6, 0xFE, 0x73, 0x25, 0x40, 0xF1, 0xB7, 0x05, 0x00, 0xC0, 0x13, 0x00, 0x00, 0x00,
+  0x13, 0x00, 0x00, 0x00, 0x0F, 0x10, 0x00, 0x00, 0x0F, 0x00, 0xF0, 0x0F, 0x37, 0x06, 0x00, 0x80,
+  0x67, 0x00, 0x06, 0x00, 0x13, 0x16, 0xA5, 0x00, 0x33, 0x02, 0xC2, 0x00, 0x13, 0x01, 0x15, 0x00,
+  0x13, 0x11, 0xA1, 0x00, 0x33, 0x01, 0x41, 0x00, 0x6F, 0x00, 0x80, 0x29, 0x13, 0x01, 0x01, 0xEF,
+  0x23, 0x22, 0x11, 0x00, 0x23, 0x24, 0x21, 0x00, 0x23, 0x26, 0x31, 0x00, 0x23, 0x28, 0x41, 0x00,
+  0x23, 0x2A, 0x51, 0x00, 0x23, 0x2C, 0x61, 0x00, 0x23, 0x2E, 0x71, 0x00, 0x23, 0x20, 0x81, 0x02,
+  0x23, 0x22, 0x91, 0x02, 0x23, 0x24, 0xA1, 0x02, 0x23, 0x26, 0xB1, 0x02, 0x23, 0x28, 0xC1, 0x02,
+  0x23, 0x2A, 0xD1, 0x02, 0x23, 0x2C, 0xE1, 0x02, 0x23, 0x2E, 0xF1, 0x02, 0x23, 0x20, 0x01, 0x05,
+  0x23, 0x22, 0x11, 0x05, 0x23, 0x24, 0x21, 0x05, 0x23, 0x26, 0x31, 0x05, 0x23, 0x28, 0x41, 0x05,
+  0x23, 0x2A, 0x51, 0x05, 0x23, 0x2C, 0x61, 0x05, 0x23, 0x2E, 0x71, 0x05, 0x23, 0x20, 0x81, 0x07,
+  0x23, 0x22, 0x91, 0x07, 0x23, 0x24, 0xA1, 0x07, 0x23, 0x26, 0xB1, 0x07, 0x23, 0x28, 0xC1, 0x07,
+  0x23, 0x2A, 0xD1, 0x07, 0x23, 0x2C, 0xE1, 0x07, 0x23, 0x2E, 0xF1, 0x07, 0x73, 0x25, 0x20, 0x34,
+  0xF3, 0x25, 0x10, 0x34, 0x13, 0x06, 0x01, 0x00, 0xEF, 0x00, 0x80, 0x09, 0x73, 0x10, 0x15, 0x34,
+  0xB7, 0x22, 0x00, 0x00, 0x93, 0x82, 0x02, 0x80, 0x73, 0xA0, 0x02, 0x30, 0x83, 0x20, 0x41, 0x00,
+  0x03, 0x21, 0x81, 0x00, 0x83, 0x21, 0xC1, 0x00, 0x03, 0x22, 0x01, 0x01, 0x83, 0x22, 0x41, 0x01,
+  0x03, 0x23, 0x81, 0x01, 0x83, 0x23, 0xC1, 0x01, 0x03, 0x24, 0x01, 0x02, 0x83, 0x24, 0x41, 0x02,
+  0x03, 0x25, 0x81, 0x02, 0x83, 0x25, 0xC1, 0x02, 0x03, 0x26, 0x01, 0x03, 0x83, 0x26, 0x41, 0x03,
+  0x03, 0x27, 0x81, 0x03, 0x83, 0x27, 0xC1, 0x03, 0x03, 0x28, 0x01, 0x04, 0x83, 0x28, 0x41, 0x04,
+  0x03, 0x29, 0x81, 0x04, 0x83, 0x29, 0xC1, 0x04, 0x03, 0x2A, 0x01, 0x05, 0x83, 0x2A, 0x41, 0x05,
+  0x03, 0x2B, 0x81, 0x05, 0x83, 0x2B, 0xC1, 0x05, 0x03, 0x2C, 0x01, 0x06, 0x83, 0x2C, 0x41, 0x06,
+  0x03, 0x2D, 0x81, 0x06, 0x83, 0x2D, 0xC1, 0x06, 0x03, 0x2E, 0x01, 0x07, 0x83, 0x2E, 0xC1, 0x07,
+  0x03, 0x2F, 0x81, 0x07, 0x83, 0x2F, 0xC1, 0x07, 0x13, 0x01, 0x01, 0x11, 0x73, 0x00, 0x20, 0x30,
+  0x13, 0x01, 0x01, 0xFF, 0x17, 0x15, 0x00, 0x00, 0x13, 0x05, 0x45, 0xEC, 0x23, 0x26, 0x11, 0x00,
+  0xEF, 0x00, 0xC0, 0x34, 0x83, 0x20, 0xC1, 0x00, 0x13, 0x05, 0x00, 0x00, 0x13, 0x01, 0x01, 0x01,
+  0x67, 0x80, 0x00, 0x00, 0x17, 0x15, 0x00, 0x00, 0x13, 0x05, 0x05, 0xEB, 0x6F, 0x00, 0x00, 0x33,
+  0x17, 0x15, 0x00, 0x00, 0x13, 0x05, 0xC5, 0xEA, 0x6F, 0x00, 0x40, 0x32, 0x63, 0x14, 0x05, 0x00,
+  0x67, 0x80, 0x00, 0x00, 0x6F, 0x00, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFF, 0x23, 0x26, 0x11, 0x00,
+  0x23, 0x24, 0x81, 0x00, 0x03, 0x44, 0x05, 0x00, 0x63, 0x04, 0x04, 0x04, 0x23, 0x22, 0x91, 0x00,
+  0x23, 0x20, 0x21, 0x01, 0x93, 0x04, 0x05, 0x00, 0x13, 0x09, 0xA0, 0x00, 0x6F, 0x00, 0xC0, 0x00,
+  0x03, 0xC4, 0x04, 0x00, 0x63, 0x02, 0x04, 0x02, 0x13, 0x05, 0x04, 0x00, 0x93, 0x84, 0x14, 0x00,
+  0xEF, 0x00, 0x00, 0x26, 0xE3, 0x16, 0x24, 0xFF, 0x13, 0x05, 0xD0, 0x00, 0xEF, 0x00, 0x40, 0x25,
+  0x03, 0xC4, 0x04, 0x00, 0xE3, 0x12, 0x04, 0xFE, 0x83, 0x24, 0x41, 0x00, 0x03, 0x29, 0x01, 0x00,
+  0x13, 0x05, 0xA0, 0x00, 0xEF, 0x00, 0xC0, 0x23, 0x13, 0x05, 0xD0, 0x00, 0xEF, 0x00, 0x40, 0x23,
+  0x83, 0x20, 0xC1, 0x00, 0x03, 0x24, 0x81, 0x00, 0x13, 0x05, 0x10, 0x00, 0x13, 0x01, 0x01, 0x01,
+  0x67, 0x80, 0x00, 0x00, 0x93, 0x04, 0x05, 0x00, 0x13, 0x05, 0x00, 0x00, 0x93, 0x84, 0x14, 0x00,
+  0xEF, 0x00, 0xC0, 0x24, 0xE3, 0x1C, 0x24, 0xFF, 0x63, 0x07, 0x04, 0x01, 0x67, 0x80, 0x00, 0x00,
+  0x93, 0x05, 0x00, 0x00, 0x13, 0x04, 0x05, 0x00, 0x13, 0x05, 0x00, 0x00, 0x93, 0x84, 0x14, 0x00,
+  0xEF, 0x00, 0x80, 0x24, 0xE3, 0x1B, 0x24, 0xFF, 0x63, 0x08, 0x04, 0x00, 0x63, 0x16, 0x04, 0x01,
+  0x67, 0x80, 0x00, 0x00, 0x13, 0x05, 0xD0, 0x00, 0xEF, 0x00, 0x40, 0x24, 0x83, 0x20, 0xC1, 0x00,
+  0x13, 0x05, 0x04, 0x00, 0x03, 0x24, 0x81, 0x00, 0x13, 0x01, 0x01, 0x01, 0x67, 0x80, 0x00, 0x00,
+  0x13, 0x05, 0xD0, 0x00, 0xEF, 0xF0, 0xCF, 0xFC, 0x83, 0x20, 0xC1, 0x00, 0x13, 0x05, 0x04, 0x00,
+  0x03, 0x24, 0x81, 0x00, 0x13, 0x01, 0x01, 0x01, 0x67, 0x80, 0x00, 0x00, 0x13, 0x05, 0x50, 0x01,
+  0xEF, 0xF0, 0xBF, 0xF2, 0x83, 0x20, 0xC1, 0x00, 0x13, 0x05, 0x04, 0x00, 0x03, 0x24, 0x81, 0x00,
+  0x13, 0x01, 0x01, 0x01, 0x67, 0x80, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFF, 0x23, 0x24, 0x81, 0x00,
+  0x23, 0x26, 0x11, 0x00, 0x13, 0x04, 0x05, 0x00, 0x03, 0x47, 0x05, 0x00, 0x37, 0x05, 0x00, 0x80,
+  0x33, 0x07, 0xA7, 0x00, 0x63, 0x89, 0x07, 0x00, 0x33, 0x87, 0xA7, 0x00, 0x13, 0x05, 0x04, 0x00,
+  0xEF, 0xF0, 0x1F, 0xF9, 0x83, 0x20, 0xC1, 0x00, 0x13, 0x05, 0x04, 0x00, 0x03, 0x24, 0x81, 0x00,
+  0x13, 0x01, 0x01, 0x01, 0x67, 0x80, 0x00, 0x00, 0x03, 0x47, 0x04, 0x00, 0x03, 0x45, 0x14, 0x00,
+  0xB7, 0x05, 0x00, 0x40, 0x93, 0x85, 0x05, 0x08, 0x13, 0x76, 0x15, 0x00, 0x33, 0x06, 0xE7, 0x00,
+  0xEF, 0xF0, 0x6F, 0xFC, 0x83, 0x20, 0xC1, 0x00, 0x13, 0x05, 0x04, 0x00, 0x03, 0x24, 0x81, 0x00,
+  0x13, 0x01, 0x01, 0x01, 0x67, 0x80, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFD, 0x23, 0x24, 0x81, 0x02,
+  0x23, 0x26, 0x91, 0x02, 0x23, 0x28, 0x11, 0x03, 0x23, 0x2A, 0x21, 0x03, 0x23, 0x2C, 0x31, 0x03,
+  0x23, 0x2E, 0x41, 0x03, 0x23, 0x20, 0x51, 0x01, 0x23, 0x22, 0x61, 0x01, 0x23, 0x24, 0x71, 0x01,
+  0x93, 0x04, 0x05, 0x00, 0x13, 0x09, 0x0A, 0x00, 0x93, 0x08, 0x06, 0x00, 0x13, 0x07, 0x00, 0x00,
+  0x37, 0x05, 0x00, 0x40, 0x93, 0x85, 0x05, 0x08, 0x23, 0x28, 0x51, 0x01, 0x23, 0x24, 0x81, 0x01,
+  0x23, 0x22, 0x91, 0x01, 0x93, 0x0A, 0x00, 0x00, 0x23, 0x20, 0x71, 0x01, 0x13, 0x05, 0x43, 0x00,
+  0xEF, 0xF0, 0x6F, 0xF4, 0x13, 0x06, 0x00, 0x00, 0x37, 0x05, 0x00, 0x10, 0x93, 0x85, 0x55, 0x00,
+  0x03, 0x25, 0x05, 0x00, 0x13, 0x75, 0x15, 0x00, 0x63, 0x8C, 0x05, 0x00, 0x93, 0x0A, 0x10, 0x00,
+  0x6F, 0x00, 0x40, 0x01, 0x13, 0x06, 0x06, 0x01, 0x37, 0x05, 0x00, 0x10, 0x93, 0x85, 0x55, 0x00,
+  0x03, 0x25, 0x05, 0x00, 0x13, 0x75, 0x15, 0x00, 0xE3, 0x1C, 0x05, 0xFE, 0x83, 0x2A, 0x41, 0x01,
+  0xE3, 0x02, 0x05, 0x06, 0x03, 0x25, 0x41, 0x01, 0x13, 0x06, 0x15, 0x00, 0xEF, 0xF0, 0xAF, 0xE6,
+  0x23, 0x26, 0x01, 0x00, 0x83, 0x24, 0x01, 0x00, 0x63, 0x8A, 0x04, 0x02, 0x83, 0x25, 0x41, 0x01,
+  0x03, 0x26, 0x81, 0x01, 0x83, 0x2A, 0x41, 0x01, 0x13, 0x05, 0x05, 0x08, 0xEF, 0xF0, 0x4F, 0xCB,
+  0x03, 0x25, 0x41, 0x01, 0x63, 0x86, 0x05, 0x01, 0x03, 0x25, 0x41, 0x01, 0x83, 0x2A, 0x41, 0x01,
+  0x13, 0x05, 0x15, 0x00, 0x93, 0x06, 0x0A, 0x00, 0x23, 0x26, 0xA1, 0x01, 0x37, 0x05, 0x03, 0x00,
+  0x93, 0x85, 0x85, 0xC7, 0x63, 0x64, 0x56, 0x01, 0x83, 0x2A, 0x41, 0x01, 0x13, 0x05, 0x0F, 0x00,
+  0xEF, 0xF0, 0xEF, 0xF0, 0x6F, 0x00, 0x00, 0x00, 0x03, 0x25, 0x01, 0x00, 0x83, 0x2A, 0x41, 0x01,
+  0x63, 0x12, 0x05, 0x02, 0x13, 0x05, 0x06, 0x00, 0xEF, 0xF0, 0xEF, 0xEF, 0x83, 0x29, 0x81, 0x01,
+  0x13, 0x05, 0x01, 0x00, 0x67, 0x80, 0x00, 0x00, 0x13, 0x05, 0x15, 0x00, 0xEF, 0xF0, 0x8F, 0xEE,
+  0x6F, 0xF0, 0x1F, 0xFD, 0x13, 0x05, 0x06, 0x00, 0xEF, 0xF0, 0xBF, 0xEE, 0x6F, 0xF0, 0x1F, 0xFE,
+  0x23, 0x22, 0x91, 0x00, 0x93, 0x04, 0x35, 0x00, 0x93, 0x06, 0x04, 0x00, 0x93, 0x05, 0x00, 0x08,
+  0x83, 0x29, 0xC1, 0x01, 0xEF, 0xF0, 0xAF, 0xA8, 0x83, 0x20, 0xC1, 0x01, 0x03, 0x24, 0x81, 0x01,
+  0x83, 0x24, 0x41, 0x01, 0x13, 0x01, 0x01, 0x03, 0x67, 0x80, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFE,
+  0x23, 0x26, 0x11, 0x00, 0x23, 0x24, 0x81, 0x00, 0x23, 0x22, 0x91, 0x00, 0x23, 0x20, 0x01, 0x01,
+  0x13, 0x04, 0x25, 0x00, 0x13, 0x09, 0x14, 0x00, 0x93, 0x05, 0x10, 0x00, 0xEF, 0xF0, 0x2F, 0xE4,
+  0x13, 0x09, 0x04, 0x00, 0x93, 0x05, 0x00, 0x00, 0x6F, 0x00, 0x00, 0x02, 0x03, 0x27, 0x09, 0x00,
+  0x23, 0x00, 0xE4, 0x00, 0x13, 0x09, 0x19, 0x00, 0x13, 0x05, 0x00, 0x00, 0x13, 0x04, 0x05, 0x00,
+  0xE3, 0x98, 0xE4, 0xFE, 0x83, 0x20, 0xC1, 0x01, 0x03, 0x24, 0x81, 0x01, 0x83, 0x24, 0x41, 0x01,
+  0x83, 0x28, 0x01, 0x01, 0x13, 0x01, 0x01, 0x02, 0x67, 0x80, 0x00, 0x00, 0x03, 0x47, 0x05, 0x00,
+  0x13, 0x07, 0x07, 0xFF, 0x03, 0x47, 0x07, 0x00, 0x63, 0x84, 0x07, 0x00, 0x13, 0x05, 0x00, 0x00,
+  0x67, 0x80, 0x00, 0x00, 0x03, 0x45, 0x14, 0x00, 0x67, 0x80, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFF,
+  0x23, 0x26, 0x11, 0x00, 0x23, 0x24, 0x81, 0x00, 0x13, 0x04, 0x05, 0x00, 0x13, 0x05, 0xE8, 0x03,
+  0x23, 0x22, 0x91, 0x00, 0xEF, 0xF0, 0xBF, 0xEA, 0x83, 0x47, 0x14, 0x00, 0x63, 0x8A, 0x07, 0x01,
+  0x03, 0x45, 0x14, 0x00, 0x83, 0x20, 0xC1, 0x00, 0x03, 0x24, 0x81, 0x00, 0x13, 0x01, 0x01, 0x01,
+  0x67, 0x80, 0x00, 0x00, 0x13, 0x05, 0x00, 0x00, 0x83, 0x20, 0xC1, 0x00, 0x03, 0x24, 0x81, 0x00,
+  0x13, 0x01, 0x01, 0x01, 0x67, 0x80, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFF, 0x23, 0x26, 0x11, 0x00,
+  0x6F, 0x00, 0x80, 0x00, 0x03, 0x25, 0x44, 0x00, 0x93, 0x05, 0x15, 0x00, 0xE3, 0x0E, 0x05, 0xFE,
+  0x83, 0x20, 0xC1, 0x00, 0x13, 0x01, 0x01, 0x01, 0x67, 0x80, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFE,
+  0x23, 0x26, 0x11, 0x00, 0x23, 0x24, 0x81, 0x00, 0x13, 0x04, 0x05, 0x00, 0xEF, 0xF0, 0xBF, 0xE9,
+  0x83, 0x20, 0xC1, 0x01, 0x03, 0x24, 0x81, 0x01, 0x13, 0x01, 0x01, 0x02, 0x67, 0x80, 0x00, 0x00,
+  0x13, 0x01, 0x01, 0xFE, 0x23, 0x26, 0x11, 0x00, 0x23, 0x24, 0x81, 0x00, 0x23, 0x22, 0x91, 0x00,
+  0x13, 0x04, 0x05, 0x00, 0x03, 0x25, 0x04, 0x00, 0xEF, 0xF0, 0x7F, 0xE9, 0x03, 0x25, 0x04, 0x00,
+  0xEF, 0xF0, 0xBF, 0xE8, 0x83, 0x20, 0xC1, 0x01, 0x03, 0x24, 0x81, 0x01, 0x13, 0x01, 0x01, 0x02,
+  0x67, 0x80, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFE, 0x23, 0x26, 0x11, 0x00, 0x23, 0x24, 0x81, 0x00,
+  0x23, 0x22, 0x91, 0x00, 0x13, 0x04, 0x05, 0x00, 0x83, 0x25, 0x04, 0x00, 0xEF, 0xF0, 0x2F, 0xE9,
+  0x83, 0x25, 0x04, 0x00, 0x13, 0x05, 0x05, 0x04, 0xEF, 0xF0, 0x6F, 0xE8, 0x83, 0x20, 0xC1, 0x01,
+  0x03, 0x24, 0x81, 0x01, 0x13, 0x01, 0x01, 0x02, 0x67, 0x80, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFD,
+  0x23, 0x24, 0x81, 0x02, 0x23, 0x26, 0x91, 0x02, 0x23, 0x28, 0x11, 0x03, 0x23, 0x2A, 0x21, 0x03,
+  0x23, 0x2C, 0x31, 0x03, 0x23, 0x2E, 0x41, 0x03, 0x23, 0x20, 0x51, 0x01, 0x23, 0x22, 0x61, 0x01,
+  0x23, 0x24, 0x71, 0x01, 0x13, 0x04, 0x06, 0x00, 0x13, 0x0A, 0x05, 0x00, 0x03, 0x47, 0x05, 0x00,
+  0x13, 0x09, 0x00, 0x00, 0x37, 0x05, 0x00, 0x10, 0x93, 0x85, 0x05, 0x06, 0x23, 0x20, 0xE1, 0x01,
+  0x03, 0x25, 0x51, 0x01, 0x03, 0x26, 0x61, 0x01, 0x03, 0x27, 0x71, 0x01, 0x83, 0x27, 0x81, 0x01,
+  0x03, 0x28, 0x91, 0x01, 0x63, 0x82, 0xC7, 0x02, 0x33, 0x06, 0x97, 0x00, 0x33, 0x05, 0x98, 0x00,
+  0x03, 0x48, 0x0A, 0x00, 0x83, 0x49, 0x1A, 0x00, 0x13, 0x0A, 0x1A, 0x00, 0x33, 0x07, 0x38, 0x01,
+  0x63, 0x6B, 0xE7, 0x02, 0x63, 0x76, 0x05, 0x03, 0x33, 0x05, 0x85, 0x00, 0x23, 0x20, 0xA1, 0x01,
+  0x23, 0x22, 0x91, 0x01, 0x03, 0x25, 0x04, 0x00, 0xEF, 0xF0, 0xCF, 0xE6, 0x03, 0x26, 0x41, 0x01,
+  0x13, 0x05, 0x06, 0x00, 0x33, 0x06, 0x56, 0x00, 0x03, 0x25, 0xA1, 0x01, 0x63, 0x14, 0x65, 0x00,
+  0x03, 0x25, 0x04, 0x00, 0x13, 0x06, 0x06, 0x00, 0xEF, 0xF0, 0x5F, 0xE6, 0x83, 0x2A, 0x41, 0x01,
+  0x6F, 0x00, 0x40, 0x02, 0x13, 0x05, 0x00, 0x00, 0x03, 0x29, 0xA1, 0x01, 0x83, 0x20, 0xC1, 0x02,
+  0x03, 0x24, 0x81, 0x02, 0x83, 0x24, 0x41, 0x02, 0x83, 0x29, 0xC1, 0x01, 0x03, 0x2A, 0x81, 0x01,
+  0x83, 0x2A, 0x41, 0x01, 0x03, 0x2B, 0x01, 0x01, 0x83, 0x2B, 0xC1, 0x00, 0x03, 0x2C, 0x81, 0x00,
+  0x13, 0x01, 0x01, 0x03, 0x67, 0x80, 0x00, 0x00, 0x33, 0x05, 0x98, 0x00, 0x03, 0x26, 0x04, 0x00,
+  0xEF, 0xF0, 0x3F, 0xE5, 0x83, 0x2A, 0x41, 0x01, 0x6F, 0xF0, 0xBF, 0xFD, 0x13, 0x05, 0x02, 0x00,
+  0x83, 0x20, 0xC1, 0x02, 0x03, 0x24, 0x81, 0x02, 0x83, 0x24, 0x41, 0x02, 0x83, 0x29, 0xC1, 0x01,
+  0x03, 0x2A, 0x81, 0x01, 0x83, 0x2A, 0x41, 0x01, 0x03, 0x2B, 0x01, 0x01, 0x83, 0x2B, 0xC1, 0x00,
+  0x03, 0x2C, 0x81, 0x00, 0x13, 0x01, 0x01, 0x03, 0x67, 0x80, 0x00, 0x00, 0x13, 0x05, 0x04, 0x00,
+  0x83, 0x20, 0xC1, 0x02, 0x03, 0x24, 0x81, 0x02, 0x83, 0x24, 0x41, 0x02, 0x83, 0x29, 0xC1, 0x01,
+  0x03, 0x2A, 0x81, 0x01, 0x83, 0x2A, 0x41, 0x01, 0x03, 0x2B, 0x01, 0x01, 0x83, 0x2B, 0xC1, 0x00,
+  0x03, 0x2C, 0x81, 0x00, 0x13, 0x01, 0x01, 0x03, 0x67, 0x80, 0x00, 0x00, 0x13, 0x05, 0x03, 0x00,
+  0x83, 0x20, 0xC1, 0x02, 0x03, 0x24, 0x81, 0x02, 0x83, 0x24, 0x41, 0x02, 0x83, 0x29, 0xC1, 0x01,
+  0x03, 0x2A, 0x81, 0x01, 0x83, 0x2A, 0x41, 0x01, 0x03, 0x2B, 0x01, 0x01, 0x83, 0x2B, 0xC1, 0x00,
+  0x03, 0x2C, 0x81, 0x00, 0x13, 0x01, 0x01, 0x03, 0x67, 0x80, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFD,
+  0x23, 0x24, 0x81, 0x02, 0x23, 0x26, 0x91, 0x02, 0x23, 0x28, 0x11, 0x03, 0x23, 0x2A, 0x21, 0x03,
+  0x23, 0x2C, 0x31, 0x03, 0x23, 0x2E, 0x41, 0x03, 0x23, 0x20, 0x51, 0x01, 0x23, 0x22, 0x61, 0x01,
+  0x23, 0x24, 0x71, 0x01, 0x13, 0x04, 0x05, 0x00, 0x13, 0x09, 0x0A, 0x00, 0x93, 0x08, 0x06, 0x00,
+  0x13, 0x07, 0x00, 0x00, 0x23, 0x22, 0x91, 0x01, 0x23, 0x20, 0x71, 0x01, 0x23, 0x28, 0x51, 0x01,
+  0x23, 0x24, 0x81, 0x01, 0x13, 0x05, 0x43, 0x00, 0xEF, 0xF0, 0x5F, 0xF2, 0x13, 0x06, 0x00, 0x00,
+  0x37, 0x05, 0x00, 0x10, 0x93, 0x85, 0x55, 0x00, 0x03, 0x25, 0x05, 0x00, 0x13, 0x75, 0x15, 0x00,
+  0x63, 0x8C, 0x05, 0x00, 0x93, 0x0A, 0x10, 0x00, 0x6F, 0x00, 0x40, 0x01, 0x13, 0x06, 0x06, 0x01,
+  0x37, 0x05, 0x00, 0x10, 0x93, 0x85, 0x55, 0x00, 0x03, 0x25, 0x05, 0x00, 0x13, 0x75, 0x15, 0x00,
+  0xE3, 0x1C, 0x05, 0xFE, 0x83, 0x2A, 0x41, 0x01, 0xE3, 0x02, 0x05, 0x06, 0x03, 0x25, 0x41, 0x01,
+  0x13, 0x06, 0x15, 0x00, 0xEF, 0xF0, 0xBF, 0xE4, 0x23, 0x26, 0x01, 0x00, 0x83, 0x24, 0x01, 0x00,
+  0x63, 0x8A, 0x04, 0x02, 0x83, 0x25, 0x41, 0x01, 0x03, 0x26, 0x81, 0x01, 0x83, 0x2A, 0x41, 0x01,
+  0x13, 0x05, 0x05, 0x08, 0xEF, 0xF0, 0x5F, 0xC9, 0x03, 0x25, 0x41, 0x01, 0x63, 0x86, 0x05, 0x01,
+  0x03, 0x25, 0x41, 0x01, 0x83, 0x2A, 0x41, 0x01, 0x13, 0x05, 0x15, 0x00, 0x93, 0x06, 0x0A, 0x00,
+  0x23, 0x26, 0xA1, 0x01, 0x37, 0x05, 0x03, 0x00, 0x93, 0x85, 0x85, 0xC7, 0x63, 0x64, 0x56, 0x01,
+  0x83, 0x2A, 0x41, 0x01, 0x13, 0x05, 0x0F, 0x00, 0xEF, 0xF0, 0xFF, 0xEE, 0x6F, 0x00, 0x00, 0x00,
+  0x03, 0x25, 0x01, 0x00, 0x83, 0x2A, 0x41, 0x01, 0x63, 0x12, 0x05, 0x02, 0x13, 0x05, 0x06, 0x00,
+  0xEF, 0xF0, 0xFF, 0xEE, 0x83, 0x29, 0x81, 0x01, 0x13, 0x05, 0x01, 0x00, 0x67, 0x80, 0x00, 0x00,
+  0x13, 0x05, 0x15, 0x00, 0xEF, 0xF0, 0x9F, 0xED, 0x6F, 0xF0, 0x1F, 0xFD, 0x13, 0x05, 0x06, 0x00,
+  0xEF, 0xF0, 0xCF, 0xED, 0x6F, 0xF0, 0x1F, 0xFE, 0x23, 0x22, 0x91, 0x00, 0x93, 0x04, 0x35, 0x00,
+  0x93, 0x06, 0x04, 0x00, 0x93, 0x05, 0x00, 0x08, 0x83, 0x29, 0xC1, 0x01, 0xEF, 0xF0, 0xBF, 0xA6,
+  0x83, 0x20, 0xC1, 0x01, 0x03, 0x24, 0x81, 0x01, 0x83, 0x24, 0x41, 0x01, 0x13, 0x01, 0x01, 0x03,
+  0x67, 0x80, 0x00, 0x00, 0x33, 0x05, 0xF5, 0x00, 0x23, 0x10, 0xB5, 0x00, 0x0F, 0x00, 0xF0, 0x0F,
+  0x67, 0x80, 0x00, 0x00, 0x13, 0x77, 0x15, 0x00, 0xB7, 0x07, 0x20, 0x10, 0x13, 0x35, 0x25, 0x00,
+  0x13, 0x17, 0x87, 0x00, 0x93, 0x87, 0x07, 0x10, 0x63, 0x06, 0x05, 0x00, 0xB7, 0x07, 0x00, 0x10,
+  0x93, 0x87, 0x07, 0x60, 0x33, 0x07, 0xF7, 0x00, 0x83, 0x27, 0x47, 0x00, 0x93, 0xF7, 0x07, 0x04,
+  0xE3, 0x8C, 0x07, 0xFE, 0x03, 0x25, 0x07, 0x01, 0x13, 0x15, 0x05, 0x01, 0x13, 0x55, 0x05, 0x01,
+  0x67, 0x80, 0x00, 0x00, 0x13, 0x77, 0x15, 0x00, 0xB7, 0x07, 0x20, 0x10, 0x13, 0x35, 0x25, 0x00,
+  0x13, 0x17, 0x87, 0x00, 0x93, 0x87, 0x07, 0x10, 0x63, 0x06, 0x05, 0x00, 0xB7, 0x07, 0x00, 0x10,
+  0x93, 0x87, 0x07, 0x60, 0x33, 0x07, 0xF7, 0x00, 0x83, 0x27, 0x47, 0x00, 0x93, 0xF7, 0x07, 0x01,
+  0xE3, 0x9C, 0x07, 0xFE, 0x83, 0x27, 0x47, 0x00, 0x93, 0xF7, 0x07, 0x08, 0xE3, 0x8C, 0x07, 0xFE,
+  0x23, 0x26, 0xB7, 0x00, 0x0F, 0x00, 0xF0, 0x0F, 0x67, 0x80, 0x00, 0x00, 0x13, 0x77, 0x15, 0x00,
+  0xB7, 0x07, 0x20, 0x10, 0x13, 0x35, 0x25, 0x00, 0x13, 0x17, 0x87, 0x00, 0x93, 0x87, 0x07, 0x10,
+  0x63, 0x06, 0x05, 0x00, 0xB7, 0x07, 0x00, 0x10, 0x93, 0x87, 0x07, 0x60, 0x33, 0x07, 0xF7, 0x00,
+  0x83, 0x27, 0x47, 0x00, 0x93, 0xF7, 0x07, 0x01, 0xE3, 0x9C, 0x07, 0xFE, 0x67, 0x80, 0x00, 0x00,
+  0xB7, 0x07, 0x20, 0x10, 0x13, 0x07, 0x10, 0x00, 0x93, 0x87, 0x07, 0x10, 0x63, 0x8E, 0xE5, 0x02,
+  0x63, 0x76, 0xA7, 0x02, 0x13, 0x75, 0x15, 0x00, 0x13, 0x15, 0x85, 0x00, 0x33, 0x05, 0xF5, 0x00,
+  0x83, 0x57, 0x05, 0x00, 0x37, 0x07, 0x01, 0x00, 0x13, 0x07, 0xF7, 0xEF, 0xB3, 0xF7, 0xE7, 0x00,
+  0x23, 0x10, 0xF5, 0x00, 0x0F, 0x00, 0xF0, 0x0F, 0x67, 0x80, 0x00, 0x00, 0xB7, 0x07, 0x00, 0x10,
+  0x93, 0x87, 0x07, 0x60, 0x6F, 0xF0, 0x1F, 0xFD, 0x63, 0xE6, 0xA5, 0x00, 0xB7, 0x07, 0x00, 0x10,
+  0x93, 0x87, 0x07, 0x60, 0x13, 0x75, 0x15, 0x00, 0x13, 0x15, 0x85, 0x00, 0x33, 0x05, 0xF5, 0x00,
+  0x83, 0x57, 0x05, 0x00, 0x93, 0xE7, 0x07, 0x10, 0x23, 0x10, 0xF5, 0x00, 0x0F, 0x00, 0xF0, 0x0F,
+  0x67, 0x80, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFF, 0x23, 0x24, 0x81, 0x00, 0x23, 0x26, 0x11, 0x00,
+  0x83, 0x47, 0x15, 0x00, 0x13, 0x04, 0x06, 0x00, 0x63, 0x82, 0xF5, 0x04, 0x93, 0x85, 0xF5, 0xFF,
+  0x63, 0x80, 0xB7, 0x02, 0x13, 0x05, 0x80, 0x01, 0xEF, 0xF0, 0xCF, 0xF0, 0x83, 0x20, 0xC1, 0x00,
+  0x13, 0x05, 0x04, 0x00, 0x03, 0x24, 0x81, 0x00, 0x13, 0x01, 0x01, 0x01, 0x67, 0x80, 0x00, 0x00,
+  0x13, 0x05, 0x60, 0x00, 0xEF, 0xF0, 0x0F, 0xEF, 0x83, 0x20, 0xC1, 0x00, 0x13, 0x05, 0x04, 0x00,
+  0x03, 0x24, 0x81, 0x00, 0x13, 0x01, 0x01, 0x01, 0x67, 0x80, 0x00, 0x00, 0x83, 0x47, 0x25, 0x00,
+  0x13, 0x07, 0xF0, 0x0F, 0xB3, 0x87, 0xB7, 0x00, 0x63, 0x80, 0xE7, 0x02, 0x13, 0x05, 0x50, 0x01,
+  0xEF, 0xF0, 0x4F, 0xEC, 0x83, 0x20, 0xC1, 0x00, 0x13, 0x05, 0x04, 0x00, 0x03, 0x24, 0x81, 0x00,
+  0x13, 0x01, 0x01, 0x01, 0x67, 0x80, 0x00, 0x00, 0x23, 0x22, 0x91, 0x00, 0x93, 0x04, 0x35, 0x00,
+  0x13, 0x85, 0x04, 0x00, 0x93, 0x05, 0x20, 0x08, 0xEF, 0xF0, 0xDF, 0xD3, 0x63, 0x1C, 0x05, 0x02,
+  0x13, 0x85, 0x04, 0x00, 0x13, 0x06, 0x04, 0x00, 0x93, 0x05, 0x00, 0x08, 0xEF, 0xF0, 0x5F, 0xB3,
+  0x13, 0x05, 0x60, 0x00, 0xEF, 0xF0, 0x0F, 0xE8, 0x13, 0x04, 0x04, 0x08, 0x83, 0x20, 0xC1, 0x00,
+  0x13, 0x05, 0x04, 0x00, 0x03, 0x24, 0x81, 0x00, 0x83, 0x24, 0x41, 0x00, 0x13, 0x01, 0x01, 0x01,
+  0x67, 0x80, 0x00, 0x00, 0x83, 0x24, 0x41, 0x00, 0x6F, 0xF0, 0x5F, 0xF9, 0x13, 0x01, 0x01, 0xFD,
+  0xB7, 0x17, 0x00, 0x00, 0x23, 0x24, 0x81, 0x02, 0x93, 0x87, 0x17, 0x02, 0x37, 0x04, 0x00, 0x10,
+  0x23, 0x2E, 0x31, 0x01, 0x23, 0x26, 0x11, 0x02, 0x23, 0x22, 0x91, 0x02, 0x23, 0x20, 0x21, 0x03,
+  0x23, 0x2C, 0x41, 0x01, 0x23, 0x2A, 0x51, 0x01, 0x23, 0x28, 0x61, 0x01, 0x23, 0x26, 0x71, 0x01,
+  0x23, 0x24, 0x81, 0x01, 0x93, 0x09, 0x05, 0x00, 0x23, 0xA4, 0x01, 0x80, 0x17, 0x07, 0x00, 0x00,
+  0x23, 0x10, 0xF7, 0x2C, 0x13, 0x04, 0x04, 0x10, 0x13, 0x05, 0x30, 0x04, 0xEF, 0xF0, 0x8F, 0xE0,
+  0xB7, 0x97, 0x04, 0x00, 0x93, 0x87, 0x07, 0x3E, 0x6F, 0x00, 0x80, 0x00, 0xE3, 0x86, 0x07, 0xFE,
+  0x03, 0x29, 0x44, 0x01, 0x93, 0x87, 0xF7, 0xFF, 0x13, 0x79, 0x19, 0x00, 0xE3, 0x08, 0x09, 0xFE,
+  0x13, 0x8C, 0xC1, 0xA2, 0xEF, 0xF0, 0x8F, 0xE0, 0x93, 0x0B, 0x10, 0x00, 0x23, 0x00, 0xAC, 0x00,
+  0x13, 0x0A, 0x09, 0x00, 0x13, 0x0B, 0x00, 0x00, 0x93, 0x0A, 0x00, 0x00, 0x93, 0x84, 0x11, 0xAB,
+  0x63, 0x1A, 0x75, 0x05, 0x13, 0x84, 0xD1, 0xA2, 0xEF, 0xF0, 0x4F, 0xDE, 0x23, 0x00, 0xA4, 0x00,
+  0x13, 0x04, 0x14, 0x00, 0xE3, 0x1A, 0x94, 0xFE, 0x93, 0x86, 0x09, 0x00, 0x13, 0x86, 0x0A, 0x00,
+  0x93, 0x05, 0x0A, 0x00, 0x13, 0x85, 0xC1, 0xA2, 0xEF, 0xF0, 0xDF, 0xE6, 0x63, 0x8C, 0xAA, 0x00,
+  0x13, 0x0A, 0x1A, 0x00, 0x93, 0x07, 0xF0, 0x0F, 0x13, 0x0B, 0x0B, 0x08, 0x63, 0xF4, 0x47, 0x01,
+  0x13, 0x0A, 0x00, 0x00, 0x93, 0x0A, 0x05, 0x00, 0xEF, 0xF0, 0x4F, 0xDA, 0x23, 0x00, 0xAC, 0x00,
+  0xE3, 0x0A, 0x75, 0xFB, 0x93, 0x07, 0x40, 0x00, 0x63, 0x0C, 0xF5, 0x02, 0x83, 0x20, 0xC1, 0x02,
+  0x03, 0x24, 0x81, 0x02, 0x83, 0x24, 0x41, 0x02, 0x83, 0x29, 0xC1, 0x01, 0x03, 0x2A, 0x81, 0x01,
+  0x83, 0x2A, 0x41, 0x01, 0x03, 0x2B, 0x01, 0x01, 0x83, 0x2B, 0xC1, 0x00, 0x03, 0x2C, 0x81, 0x00,
+  0x13, 0x05, 0x09, 0x00, 0x03, 0x29, 0x01, 0x02, 0x13, 0x01, 0x01, 0x03, 0x67, 0x80, 0x00, 0x00,
+  0x13, 0x05, 0x60, 0x00, 0xEF, 0xF0, 0x0F, 0xD3, 0x13, 0x09, 0x0B, 0x00, 0x6F, 0xF0, 0x1F, 0xFC,
+  0x83, 0x47, 0x15, 0x00, 0x63, 0x8C, 0xB7, 0x00, 0x93, 0x85, 0xF5, 0xFF, 0x33, 0x85, 0xB7, 0x40,
+  0x13, 0x35, 0x15, 0x00, 0x13, 0x05, 0xD5, 0xFF, 0x67, 0x80, 0x00, 0x00, 0x03, 0x47, 0x25, 0x00,
+  0x93, 0x06, 0xF0, 0x0F, 0xB3, 0x07, 0xF7, 0x00, 0x63, 0x86, 0xD7, 0x00, 0x13, 0x05, 0xF0, 0xFF,
+  0x67, 0x80, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFF, 0x13, 0x05, 0x35, 0x00, 0x93, 0x05, 0x20, 0x08,
+  0x23, 0x26, 0x11, 0x00, 0xEF, 0xF0, 0x1F, 0xB8, 0x93, 0x07, 0x05, 0x00, 0x13, 0x05, 0x10, 0x00,
+  0x63, 0x84, 0x07, 0x00, 0x13, 0x05, 0xF0, 0xFF, 0x83, 0x20, 0xC1, 0x00, 0x13, 0x01, 0x01, 0x01,
+  0x67, 0x80, 0x00, 0x00, 0x73, 0x25, 0x40, 0xF1, 0x0F, 0x00, 0xF0, 0x0F, 0x0F, 0x10, 0x00, 0x00,
+  0x67, 0x00, 0x05, 0x00, 0x13, 0x01, 0x01, 0xFF, 0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x85, 0x0A,
+  0x23, 0x26, 0x11, 0x00, 0xEF, 0xF0, 0xCF, 0xD1, 0x83, 0x20, 0xC1, 0x00, 0x13, 0x05, 0xF0, 0xFF,
+  0x13, 0x01, 0x01, 0x01, 0x67, 0x80, 0x00, 0x00, 0x13, 0x01, 0x01, 0xFF, 0x93, 0x07, 0x10, 0x00,
+  0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0xC5, 0x0D, 0x23, 0x26, 0x11, 0x00, 0x23, 0xAA, 0xF1, 0x80,
+  0x23, 0x24, 0x81, 0x00, 0xEF, 0xF0, 0xCF, 0xCE, 0x13, 0x05, 0x30, 0x00, 0xEF, 0xF0, 0x4F, 0xE1,
+  0x13, 0x04, 0x05, 0x00, 0x93, 0x05, 0x30, 0x00, 0x13, 0x05, 0x00, 0x00, 0xEF, 0xF0, 0x1F, 0x9F,
+  0x93, 0x05, 0x30, 0x00, 0x37, 0x05, 0x01, 0x00, 0xEF, 0xF0, 0x5F, 0x9E, 0x93, 0x05, 0x30, 0x00,
+  0x37, 0x05, 0x02, 0x00, 0xEF, 0xF0, 0x9F, 0x9D, 0x93, 0x05, 0x30, 0x00, 0x37, 0x05, 0x03, 0x00,
+  0xEF, 0xF0, 0xDF, 0x9C, 0x13, 0x05, 0x04, 0x00, 0xEF, 0xF0, 0x5F, 0xDD, 0x17, 0x05, 0x00, 0x00,
+  0x13, 0x05, 0x05, 0x09, 0xEF, 0xF0, 0xCF, 0xC9, 0x6F, 0x00, 0x00, 0x00, 0x0A, 0x0D, 0x54, 0x52,
+  0x41, 0x50, 0x0A, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x41, 0x42, 0x4F, 0x52, 0x54, 0x0A, 0x0D, 0x00,
+  0x45, 0x58, 0x49, 0x54, 0x0A, 0x0D, 0x00, 0x00, 0x0D, 0x0A, 0x46, 0x6C, 0x61, 0x73, 0x68, 0x20,
+  0x49, 0x6E, 0x69, 0x74, 0x69, 0x61, 0x6C, 0x69, 0x7A, 0x65, 0x64, 0x0D, 0x0A, 0x00, 0x00, 0x00,
+  0x5B, 0x49, 0x4E, 0x46, 0x4F, 0x5D, 0x20, 0x65, 0x65, 0x70, 0x72, 0x6F, 0x6D, 0x20, 0x00, 0x00,
+  0x3A, 0x00, 0x00, 0x00, 0x0D, 0x0A, 0x00, 0x00, 0x0D, 0x0A, 0x5B, 0x50, 0x41, 0x47, 0x45, 0x20,
+  0x45, 0x52, 0x52, 0x4F, 0x52, 0x5D, 0x0A, 0x00, 0x0D, 0x0A, 0x5B, 0x45, 0x52, 0x41, 0x53, 0x45,
+  0x20, 0x45, 0x52, 0x52, 0x4F, 0x52, 0x5D, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x0D, 0x4D, 0x49,
+  0x4E, 0x20, 0x46, 0x4C, 0x41, 0x53, 0x48, 0x45, 0x52, 0x0A, 0x0D, 0x00, 0x0A, 0x0D, 0x20, 0x46,
+  0x6C, 0x61, 0x73, 0x68, 0x20, 0x70, 0x72, 0x6F, 0x67, 0x72, 0x61, 0x6D, 0x6D, 0x69, 0x6E, 0x67,
+  0x20, 0x63, 0x6F, 0x6D, 0x70, 0x6C, 0x65, 0x74, 0x65, 0x64, 0x0A, 0x0D, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+//  PROGRAMMING STATE MACHINE
+enum ProgrammingState {
+  STATE_IDLE,
+  STATE_DEVICE_CONNECTED,
+  STATE_WAITING_FOR_BOOTLOADER,
+  STATE_PROGRAMMING,
+  STATE_SUCCESS,
+  STATE_FAILED_RETRY
+};
+
+//  USB HOST RECOVERY STATE MACHINE
+enum UsbHostState {
+  USB_HOST_STOPPED,
+  USB_HOST_RUNNING,
+  USB_HOST_RECOVERY_WAIT
+};
+
+//  GLOBALS
+WebServer server(80);
+
+EspUsbHost usb;
+EspUsbHostCdcSerial CdcSerial(usb);
+
+volatile bool             isDeviceConnected   = false;
+volatile ProgrammingState progState           = STATE_IDLE;
+uint32_t                  connectTime         = 0;
+bool                      flashDone           = false;
+
+// Non-blocking USB Host Recovery state trackers
+UsbHostState              usbHostState        = USB_HOST_STOPPED;
+uint32_t                  usbStateTimer       = 0;
+
+File                   uploadFile;
+mbedtls_sha256_context shaCtx;
+size_t                 uploadBytesReceived = 0;
+uint32_t               uploadStartTime     = 0;
+String                 computedShaHex      = "";
+bool                   uploadHasError      = false;
+String                 uploadErrorMessage  = "";
+
+// Firmware Checksum Cache (Prevents disk I/O bottlenecks during website polling)
+String cachedFwChecksum = "NONE";
+size_t cachedFwSize     = 0;
+bool   cachedFwExists   = false;
+
+// Global flag for intentional Wi-Fi change request (handled in loop())
+volatile bool  wifiChangeRequested = false;
+
+// Global WiFiManager instance
+WiFiManager    wm;
+
+// Helper string conversion for state logging
+const char* getProgrammingStateName(ProgrammingState s) {
+  switch (s) {
+    case STATE_IDLE:                   return "IDLE";
+    case STATE_DEVICE_CONNECTED:       return "DEVICE_CONNECTED";
+    case STATE_WAITING_FOR_BOOTLOADER: return "WAITING_FOR_BOOTLOADER";
+    case STATE_PROGRAMMING:            return "PROGRAMMING";
+    case STATE_SUCCESS:                return "SUCCESS";
+    case STATE_FAILED_RETRY:           return "FAILED_RETRY";
+    default:                           return "UNKNOWN";
+  }
+}
+
+//  NON-BLOCKING TIMING & SYSTEM HELPERS
+void delay_keep_alive(uint32_t ms) {
+  uint32_t start = millis();
+  while (millis() - start < ms) {
+    server.handleClient();
+    delay(1);
+  }
+}
+
+//  SHA-256 HELPERS
+String get8CharChecksum(unsigned char* output) {
+  char buf[9];
+  snprintf(buf, sizeof(buf), "%02X%02X%02X%02X",
+           output[0], output[1], output[2], output[3]);
+  return String(buf);
+}
+
+bool getExistingFileChecksum(const char* path, String &checksumOut, size_t &sizeOut) {
+  if (!LittleFS.exists(path)) return false;
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  sizeOut = f.size();
+
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  uint8_t buffer[512];
+  while (f.available()) {
+    size_t len = f.read(buffer, sizeof(buffer));
+    mbedtls_sha256_update(&ctx, buffer, len);
+  }
+  f.close();
+  unsigned char output[32];
+  mbedtls_sha256_finish(&ctx, output);
+  mbedtls_sha256_free(&ctx);
+  checksumOut = get8CharChecksum(output);
+  return true;
+}
+
+void updateCachedFirmwareInfo() {
+  cachedFwExists = getExistingFileChecksum(FIRMWARE_FILE_PATH, cachedFwChecksum, cachedFwSize);
+  if (!cachedFwExists) {
+    cachedFwChecksum = "NONE";
+    cachedFwSize     = 0;
+  }
+}
+
+//  HTTP: CORS & PRIVATE NETWORK ACCESS HELPERS
+void setCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers",
+                    "Content-Type, X-Expected-Size, X-Expected-Checksum, Access-Control-Request-Private-Network");
+
+  if (server.hasHeader("Access-Control-Request-Private-Network")) {
+    String pna = server.header("Access-Control-Request-Private-Network");
+    if (pna.equalsIgnoreCase("true")) {
+      server.sendHeader("Access-Control-Allow-Private-Network", "true");
+    }
+  }
+}
+
+void handleOptions() {
+  setCorsHeaders();
+  server.send(204);
+}
+
+//  HTTP ROUTE: GET /  - Web Dashboard with Wi-Fi Logout / Switch
+void handleLogout() {
+  setCorsHeaders();
+  wifiChangeRequested = true;
+  const char* html =
+    "<!DOCTYPE html><html><head>"
+    "<meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Switching Wi-Fi &mdash; VEGA ARISE EDU</title>"
+    "<style>"
+      "body{background:#060b14;color:#f0f6ff;font-family:'Inter',-apple-system,sans-serif;"
+        "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}"
+      ".box{background:#111827;border:1px solid #1e2d45;border-radius:20px;"
+        "padding:40px 32px;max-width:380px;width:100%;text-align:center;"
+        "box-shadow:0 20px 60px rgba(67, 47, 167, 0.7);}"
+      ".chip{display:inline-block;background:rgba(14,165,233,0.12);"
+        "border:1px solid rgba(56,189,248,0.3);color:#38bdf8;"
+        "font-size:0.7rem;font-weight:700;padding:5px 14px;"
+        "border-radius:100px;letter-spacing:1px;text-transform:uppercase;margin-bottom:18px;}"
+      ".spinner{display:inline-block;width:28px;height:28px;"
+        "border:3px solid rgba(56,189,248,0.2);border-top-color:#38bdf8;"
+        "border-radius:50%;animation:spin 0.8s linear infinite;margin-bottom:14px;}"
+      "@keyframes spin{to{transform:rotate(360deg);}}"
+      "h2{font-size:1.25rem;font-weight:800;margin-bottom:10px;color:#38bdf8;}"
+      "p{font-size:0.88rem;color:#7a93b4;line-height:1.6;margin-bottom:10px;}"
+    "</style></head><body>"
+    "<div class='box'>"
+      "<div class='chip'>VEGA ARISE EDU</div><br>"
+      "<div class='spinner'></div>"
+      "<h2>Opening Wi-Fi Setup&hellip;</h2>"
+      "<p>Logged out from Wi-Fi session.<br>"
+      "Saved credentials have been erased.<br><br>"
+      "Connect your device to the<br><strong>VEGA-PROGRAMMER</strong> Wi-Fi network,<br>"
+      "then choose your new network.</p>"
+      "<p style='font-size:0.78rem;color:#4a6080;'>AP IP: 192.168.4.1</p>"
+    "</div></body></html>";
+  server.send(200, "text/html", html);
+  Serial.println("[WiFi] User requested LOGOUT / CHANGE WI-FI. Opening setup portal...");
+}
+
+void handleRoot() {
+  setCorsHeaders();
+
+  String ssid = (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : "AP Mode (Not Connected)";
+  String ip   = (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  int32_t rssi = (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  String vegaStatus = isDeviceConnected ? "Connected (FT230X Ready)" : "Disconnected";
+  String vegaStateStr = getProgrammingStateName(progState);
+
+  String html = "<!DOCTYPE html><html lang='en'><head>"
+    "<meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>VEGA ARISE EDU &mdash; Control Dashboard</title>"
+    "<style>"
+      ":root{"
+        "--bg:#060b14;--card-bg:#0d1527;--card-border:#1e2d45;"
+        "--accent:#38bdf8;--text:#f0f6ff;--text-muted:#7a93b4;--text-dim:#4a6080;"
+        "--success:#22c55e;--danger:#ef4444;"
+      "}"
+      "*{box-sizing:border-box;margin:0;padding:0;}"
+      "body{background:var(--bg);color:var(--text);font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;"
+        "min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px;}"
+      ".container{max-width:460px;width:100%;}"
+      ".header{text-align:center;margin-bottom:24px;}"
+      ".logo-ring{width:56px;height:56px;border-radius:50%;background:rgba(14,165,233,0.1);border:1.5px solid rgba(56,189,248,0.35);"
+        "display:flex;align-items:center;justify-content:center;margin:0 auto 12px;box-shadow:0 0 20px rgba(14,165,233,0.2);}"
+      ".chip{display:inline-block;background:rgba(14,165,233,0.12);border:1px solid rgba(56,189,248,0.3);color:var(--accent);"
+        "font-size:0.72rem;font-weight:700;padding:4px 12px;border-radius:100px;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;}"
+      ".title{font-size:1.45rem;font-weight:800;letter-spacing:-0.5px;color:var(--text);}"
+      ".subtitle{font-size:0.85rem;color:var(--text-muted);margin-top:4px;}"
+      ".card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:18px;padding:22px;"
+        "margin-bottom:16px;box-shadow:0 12px 35px rgba(0,0,0,0.5);}"
+      ".card-title{font-size:0.8rem;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--accent);margin-bottom:14px;display:flex;align-items:center;gap:8px;}"
+      ".info-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:0.88rem;}"
+      ".info-row:last-child{border-bottom:none;}"
+      ".info-label{color:var(--text-muted);}"
+      ".info-val{font-weight:600;color:var(--text);}"
+      ".status-badge{display:inline-flex;align-items:center;gap:6px;font-size:0.75rem;padding:3px 10px;border-radius:100px;font-weight:600;}"
+      ".badge-online{background:rgba(34,197,94,0.15);color:var(--success);border:1px solid rgba(34,197,94,0.3);}"
+      ".badge-dot{width:6px;height:6px;border-radius:50%;background:currentColor;}"
+      ".btn-logout{"
+        "display:block;width:100%;padding:14px;background:linear-gradient(135deg,#dc2626,#991b1b);"
+        "color:#fff;border:none;border-radius:12px;font-size:0.95rem;font-weight:700;text-align:center;"
+        "text-decoration:none;cursor:pointer;letter-spacing:0.5px;box-shadow:0 4px 20px rgba(220,38,38,0.35);"
+        "transition:all 0.15s ease;margin-top:6px;"
+      "}"
+      ".btn-logout:hover{background:linear-gradient(135deg,#ef4444,#b91c1c);box-shadow:0 6px 24px rgba(220,38,38,0.5);transform:translateY(-1px);}"
+      ".btn-logout:active{transform:translateY(1px);}"
+      ".logout-desc{font-size:0.8rem;color:var(--text-muted);margin-top:10px;line-height:1.5;text-align:center;}"
+      ".footer{text-align:center;font-size:0.72rem;color:var(--text-dim);margin-top:20px;}"
+    "</style></head><body>"
+    "<div class='container'>"
+      "<div class='header'>"
+        "<div class='logo-ring'>"
+          "<svg width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='#38bdf8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>"
+            "<polyline points='22 12 18 12 15 21 9 3 6 12 2 12'></polyline>"
+          "</svg>"
+        "</div>"
+        "<div class='chip'>Control Dashboard</div>"
+        "<h1 class='title'>VEGA ARISE EDU</h1>"
+        "<div class='subtitle'>ARIES V2 Programmer Gateway</div>"
+      "</div>"
+
+      "<div class='card'>"
+        "<div class='card-title'>"
+          "<svg width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M5 12.55a11 11 0 0 1 14.08 0'></path><path d='M1.42 9a16 16 0 0 1 21.16 0'></path><path d='M8.53 16.11a6 6 0 0 1 6.95 0'></path><line x1='12' y1='20' x2='12.01' y2='20'></line></svg>"
+          "Active Wi-Fi Connection"
+        "</div>"
+        "<div class='info-row'><span class='info-label'>Network (SSID)</span><span class='info-val'>" + ssid + "</span></div>"
+        "<div class='info-row'><span class='info-label'>IP Address</span><span class='info-val'>http://" + ip + "</span></div>"
+        "<div class='info-row'><span class='info-label'>Signal</span><span class='info-val'>" + String(rssi) + " dBm</span></div>"
+        "<div class='info-row'><span class='info-label'>Wi-Fi Status</span>"
+          "<span class='status-badge badge-online'><span class='badge-dot'></span>Connected</span>"
+        "</div>"
+      "</div>"
+
+      "<div class='card'>"
+        "<div class='card-title'>"
+          "<svg width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='2' y='2' width='20' height='8' rx='2' ry='2'></rect><rect x='2' y='14' width='20' height='8' rx='2' ry='2'></rect><line x1='6' y1='6' x2='6.01' y2='6'></line><line x1='6' y1='18' x2='6.01' y2='18'></line></svg>"
+          "Hardware & Flasher Status"
+        "</div>"
+        "<div class='info-row'><span class='info-label'>VEGA Board</span><span class='info-val'>" + vegaStatus + "</span></div>"
+        "<div class='info-row'><span class='info-label'>Programmer State</span><span class='info-val'>" + vegaStateStr + "</span></div>"
+      "</div>"
+
+      "<div class='card'>"
+        "<div class='card-title'>"
+          "<svg width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M18.36 6.64a9 9 0 1 1-12.73 0'></path><line x1='12' y1='2' x2='12' y2='12'></line></svg>"
+          "Switch Wi-Fi / Disconnect"
+        "</div>"
+        "<a href='/changewifi' class='btn-logout' onclick=\"return confirm('Disconnect from currently saved Wi-Fi and open setup portal to connect to another network?');\">"
+          "Logout / Switch Wi-Fi Network"
+        "</a>"
+        "<div class='logout-desc'>"
+          "Click to erase saved Wi-Fi credentials and broadcast the <strong>VEGA-PROGRAMMER</strong> setup AP (IP: 192.168.4.1) so you can connect to another Wi-Fi network without turning off your router."
+        "</div>"
+      "</div>"
+
+      "<div class='footer'>VEGA ARISE EDU &copy; IIT Madras</div>"
+    "</div>"
+    "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+//  HTTP ROUTE: GET /status
+void handleStatus() {
+  setCorsHeaders();
+
+  size_t totalBytes = LittleFS.totalBytes();
+  size_t usedBytes  = LittleFS.usedBytes();
+  size_t freeBytes  = (totalBytes > usedBytes) ? (totalBytes - usedBytes) : 0;
+
+  String ipAddress = (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED)
+                     ? WiFi.localIP().toString()
+                     : WiFi.softAPIP().toString();
+
+  String json = "{";
+  json += "\"status\":\"ready\",";
+  json += "\"chip\":\"" + String(ESP.getChipModel()) + "\",";
+  json += "\"sdk_version\":\"" + String(ESP.getSdkVersion()) + "\",";
+  json += "\"ip\":\"" + ipAddress + "\",";
+  json += "\"mode\":\"" + String(WiFi.getMode() == WIFI_STA ? "STA" : "AP") + "\",";
+  json += "\"rssi\":" + String(WiFi.getMode() == WIFI_STA ? WiFi.RSSI() : 0) + ",";
+  json += "\"vega_connected\":" + String(isDeviceConnected ? "true" : "false") + ",";
+  json += "\"programming_state\":\"" + String(getProgrammingStateName(progState)) + "\",";
+  json += "\"flash_done\":" + String(flashDone ? "true" : "false") + ",";
+  json += "\"littlefs_total\":" + String(totalBytes) + ",";
+  json += "\"littlefs_used\":" + String(usedBytes) + ",";
+  json += "\"littlefs_free\":" + String(freeBytes) + ",";
+  json += "\"firmware\":{";
+  json += "\"exists\":" + String(cachedFwExists ? "true" : "false") + ",";
+  json += "\"filename\":\"" + String(FIRMWARE_FILE_PATH) + "\",";
+  json += "\"size\":" + String(cachedFwSize) + ",";
+  json += "\"checksum\":\"" + cachedFwChecksum + "\"";
+  json += "}}";
+  server.send(200, "application/json", json);
+}
+
+//  HTTP ROUTE: POST /upload  - completion response
+void handleUploadResponse() {
+  setCorsHeaders();
+
+  if (uploadHasError) {
+    server.send(400, "application/json",
+      "{\"success\":false,\"error\":\"" + uploadErrorMessage +
+      "\",\"received_size\":" + String(uploadBytesReceived) + "}");
+    return;
+  }
+
+  if (server.hasHeader("X-Expected-Size")) {
+    size_t expectedSize = server.header("X-Expected-Size").toInt();
+    if (expectedSize > 0 && expectedSize != uploadBytesReceived) {
+      server.send(422, "application/json",
+        "{\"success\":false,\"error\":\"Size mismatch: expected " +
+        String(expectedSize) + " got " + String(uploadBytesReceived) + "\"}");
+      return;
+    }
+  }
+
+  if (server.hasHeader("X-Expected-Checksum")) {
+    String expectedChecksum = server.header("X-Expected-Checksum");
+    expectedChecksum.toUpperCase(); expectedChecksum.trim();
+    if (expectedChecksum.length() > 0 &&
+        !computedShaHex.equalsIgnoreCase(expectedChecksum)) {
+      server.send(422, "application/json",
+        "{\"success\":false,\"error\":\"Checksum mismatch: expected " +
+        expectedChecksum + " got " + computedShaHex + "\"}");
+      return;
+    }
+  }
+
+  cachedFwExists   = true;
+  cachedFwSize     = uploadBytesReceived;
+  cachedFwChecksum = computedShaHex;
+
+  flashDone = false;
+  if (isDeviceConnected) {
+    progState   = STATE_DEVICE_CONNECTED;
+    connectTime = millis();
+  }
+
+  uint32_t timeTakenMs = millis() - uploadStartTime;
+  String json = "{\"success\":true,";
+  json += "\"filename\":\"" + String(FIRMWARE_FILE_PATH) + "\",";
+  json += "\"size\":" + String(uploadBytesReceived) + ",";
+  json += "\"checksum\":\"" + computedShaHex + "\",";
+  json += "\"time_taken_ms\":" + String(timeTakenMs) + ",";
+  json += "\"message\":\"Firmware saved. Ready to flash VEGA.\"}";
+  server.send(200, "application/json", json);
+
+  Serial.println("[HTTP] New firmware ready. Waiting for manual VEGA RESET.");
+}
+
+//  HTTP ROUTE: POST /upload  - streaming chunk handler
+void handleUploadStream() {
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    uploadStartTime     = millis();
+    uploadBytesReceived = 0;
+    uploadHasError      = false;
+    uploadErrorMessage  = "";
+    computedShaHex      = "";
+    Serial.printf("\n[HTTP] Receiving firmware -> %s\n", FIRMWARE_FILE_PATH);
+    if (LittleFS.exists(FIRMWARE_FILE_PATH))
+      LittleFS.remove(FIRMWARE_FILE_PATH);
+    uploadFile = LittleFS.open(FIRMWARE_FILE_PATH, "w");
+    if (!uploadFile) {
+      uploadHasError     = true;
+      uploadErrorMessage = "Failed to open LittleFS for writing";
+      return;
+    }
+    mbedtls_sha256_init(&shaCtx);
+    mbedtls_sha256_starts(&shaCtx, 0);
+
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!uploadHasError && uploadFile) {
+      size_t written = uploadFile.write(upload.buf, upload.currentSize);
+      if (written != upload.currentSize) {
+        uploadHasError     = true;
+        uploadErrorMessage = "LittleFS write error (disk full?)";
+      } else {
+        mbedtls_sha256_update(&shaCtx, upload.buf, upload.currentSize);
+        uploadBytesReceived += upload.currentSize;
+      }
+    }
+
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (uploadFile) uploadFile.close();
+    if (!uploadHasError) {
+      unsigned char shaOutput[32];
+      mbedtls_sha256_finish(&shaCtx, shaOutput);
+      computedShaHex = get8CharChecksum(shaOutput);
+      Serial.printf("[HTTP] Done. %u bytes | SHA: %s\n",
+                    (unsigned)uploadBytesReceived, computedShaHex.c_str());
+    }
+    mbedtls_sha256_free(&shaCtx);
+
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (uploadFile) uploadFile.close();
+    mbedtls_sha256_free(&shaCtx);
+    uploadHasError     = true;
+    uploadErrorMessage = "Upload aborted by client";
+    Serial.println("[ERROR] Upload aborted");
+  }
+}
+
+//  XMODEM: CRC-16/CCITT
+uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
+  uint16_t crc = 0;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (int j = 0; j < 8; j++) {
+      if (crc & 0x8000)
+        crc = (crc << 1) ^ 0x1021;
+      else
+        crc = crc << 1;
+    }
+  }
+  return crc;
+}
+
+//  SERIAL UTILITY FUNCTIONS
+void purge_stale_rx() {
+  while (CdcSerial.available()) {
+    CdcSerial.read();
+  }
+}
+
+int read_byte(uint32_t ms) {
+  uint32_t t = millis();
+  while (millis() - t < ms) {
+    server.handleClient();
+    if (CdcSerial.available()) {
+      int c = CdcSerial.read();
+      return c;
+    }
+    delay(1);
+  }
+  return -1;
+}
+
+int read_xmodem_response(uint32_t timeout_ms) {
+  uint32_t start = millis();
+  while (millis() - start < timeout_ms) {
+    int c = read_byte(100);
+    if (c == XMODEM_ACK || c == XMODEM_NAK || c == XMODEM_CAN) return c;
+    if (c == 'C') continue;
+    if (c == -1) continue;
+  }
+  return -1;
+}
+
+String find_app_bin() {
+  File root = LittleFS.open("/");
+  if (!root) return "";
+  File f = root.openNextFile();
+  while (f) {
+    String name  = String(f.name());
+    String lower = name; lower.toLowerCase();
+    if (lower.endsWith(".bin")) {
+      String path = name.startsWith("/") ? name : "/" + name;
+      Serial.printf("[FS] Found: %s (%u bytes)\n", path.c_str(), (unsigned)f.size());
+      return path;
+    }
+    f = root.openNextFile();
+  }
+  return "";
+}
+
+//  USB HOST CONTROL
+void startUsbHost() {
+  Serial.println("[USB] Enumeration attempt started");
+  CdcSerial.begin(115200);
+  if (!usb.begin()) {
+    Serial.printf("[USB ERROR] USB Host begin failed: %s\n", usb.lastErrorName());
+    usbHostState  = USB_HOST_RECOVERY_WAIT;
+    usbStateTimer = millis();
+  } else {
+    usbHostState  = USB_HOST_RUNNING;
+    usbStateTimer = millis();
+    Serial.println("[USB] Waiting for FT230X");
+  }
+}
+
+void triggerUsbRecovery() {
+  Serial.println("[USB] FT230X enumeration failed");
+  Serial.println("[USB] Starting USB recovery");
+  Serial.println("[USB] Allowing USB PHY/device recovery");
+  isDeviceConnected = false;
+  CdcSerial.end();
+  usb.end();
+  usbHostState  = USB_HOST_RECOVERY_WAIT;
+  usbStateTimer = millis();
+}
+
+void updateUsbHostRecovery() {
+  if (isDeviceConnected) return;
+  if (usbHostState == USB_HOST_RUNNING) {
+    // If running for >5000ms without FT230X enumeration callback, enter recovery
+    if (millis() - usbStateTimer >= 5000) triggerUsbRecovery();
+  } else if (usbHostState == USB_HOST_RECOVERY_WAIT) {
+    // Give USB PHY and attached FT230X hardware a full 1000ms idle settling time
+    if (millis() - usbStateTimer >= 1000) {
+      Serial.println("[USB] Restarting USB host");
+      startUsbHost();
+    }
+  }
+}
+
+//  XMODEM TRANSFER HELPERS
+bool send_xmodem_buffer(const uint8_t* buffer, size_t totalSize, const char* label) {
+  size_t totalBlocks = (totalSize + XMODEM_BLOCK_SIZE - 1) / XMODEM_BLOCK_SIZE;
+  uint8_t pktNum = 1;
+
+  Serial.printf("[%s] Starting XMODEM transfer (%u bytes, %u blocks)...\n",
+                label, (unsigned)totalSize, (unsigned)totalBlocks);
+
+  for (size_t blk = 1; blk <= totalBlocks; blk++) {
+    server.handleClient();
+    uint8_t packet[133];
+    uint8_t payload[XMODEM_BLOCK_SIZE];
+    size_t offset = (blk - 1) * XMODEM_BLOCK_SIZE;
+    size_t len = (offset + XMODEM_BLOCK_SIZE <= totalSize) ? XMODEM_BLOCK_SIZE : (totalSize - offset);
+    memcpy_P(payload, buffer + offset, len);
+    if (len < XMODEM_BLOCK_SIZE) memset(payload + len, XMODEM_PAD, XMODEM_BLOCK_SIZE - len);
+    packet[0] = XMODEM_SOH;
+    packet[1] = pktNum;
+    packet[2] = ~pktNum;
+    memcpy(packet + 3, payload, XMODEM_BLOCK_SIZE);
+    uint16_t crc = crc16_ccitt(payload, XMODEM_BLOCK_SIZE);
+    packet[131] = crc >> 8;
+    packet[132] = crc & 0xFF;
+    bool acked = false;
+    for (int retry = 0; retry < 10; retry++) {
+      server.handleClient();
+      CdcSerial.write(packet, 133);
+      int resp = read_xmodem_response(4000);
+      if (resp == XMODEM_ACK) {
+        acked = true;
+        if (blk % 5 == 0 || blk == totalBlocks) {
+          Serial.printf("[%s] Block %u/%u ACKed\n", label, (unsigned)blk, (unsigned)totalBlocks);
+        }
+        break;
+      } else if (resp == XMODEM_NAK) {
+        Serial.printf("[%s] Block %u NAK, retry %d\n", label, (unsigned)blk, retry + 1);
+      } else if (resp == XMODEM_CAN) {
+        Serial.printf("[%s] Transfer cancelled by VEGA (CAN)\n", label);
+        return false;
+      } else {
+        Serial.printf("[%s] Block %u timeout/no ACK, retry %d\n", label, (unsigned)blk, retry + 1);
+      }
+      delay_keep_alive(50);
+    }
+    if (!acked) {
+      Serial.printf("[%s] Block %u failed after 10 retries!\n", label, (unsigned)blk);
+      return false;
+    }
+    pktNum++;
+  }
+
+  // Send EOT
+  Serial.printf("[%s] Sending EOT...\n", label);
+  for (int retry = 0; retry < 10; retry++) {
+    server.handleClient();
+    CdcSerial.write(XMODEM_EOT);
+    int resp = read_xmodem_response(3000);
+    if (resp == XMODEM_ACK) {
+      Serial.printf("[%s] EOT ACKed!\n", label);
+      return true;
+    }
+    delay_keep_alive(100);
+  }
+  return false;
+}
+
+bool send_xmodem_file(File &f, size_t totalSize, const char* label) {
+  f.seek(0);
+  size_t totalBlocks = (totalSize + XMODEM_BLOCK_SIZE - 1) / XMODEM_BLOCK_SIZE;
+  uint8_t pktNum = 1;
+
+  Serial.printf("[%s] Starting XMODEM transfer (%u bytes, %u blocks)...\n",
+                label, (unsigned)totalSize, (unsigned)totalBlocks);
+
+  for (size_t blk = 1; blk <= totalBlocks; blk++) {
+    server.handleClient();
+    uint8_t packet[133];
+    uint8_t payload[XMODEM_BLOCK_SIZE];
+    size_t n = f.read(payload, XMODEM_BLOCK_SIZE);
+    if (n < XMODEM_BLOCK_SIZE) memset(payload + n, XMODEM_PAD, XMODEM_BLOCK_SIZE - n);
+    packet[0] = XMODEM_SOH;
+    packet[1] = pktNum;
+    packet[2] = ~pktNum;
+    memcpy(packet + 3, payload, XMODEM_BLOCK_SIZE);
+    uint16_t crc = crc16_ccitt(payload, XMODEM_BLOCK_SIZE);
+    packet[131] = crc >> 8;
+    packet[132] = crc & 0xFF;
+    bool acked = false;
+    for (int retry = 0; retry < 10; retry++) {
+      server.handleClient();
+      CdcSerial.write(packet, 133);
+      int resp = read_xmodem_response(4000);
+      if (resp == XMODEM_ACK) {
+        acked = true;
+        if (blk % 10 == 0 || blk == totalBlocks) {
+          Serial.printf("[%s] Block %u/%u ACKed\n", label, (unsigned)blk, (unsigned)totalBlocks);
+        }
+        break;
+      } else if (resp == XMODEM_NAK) {
+        Serial.printf("[%s] Block %u NAK, retry %d\n", label, (unsigned)blk, retry + 1);
+      } else if (resp == XMODEM_CAN) {
+        Serial.printf("[%s] Transfer cancelled by VEGA (CAN)\n", label);
+        return false;
+      } else {
+        Serial.printf("[%s] Block %u timeout/no ACK, retry %d\n", label, (unsigned)blk, retry + 1);
+      }
+      delay_keep_alive(50);
+    }
+    if (!acked) {
+      Serial.printf("[%s] Block %u failed after 10 retries!\n", label, (unsigned)blk);
+      return false;
+    }
+    pktNum++;
+  }
+
+  // Send EOT
+  Serial.printf("[%s] Sending EOT...\n", label);
+  for (int retry = 0; retry < 10; retry++) {
+    server.handleClient();
+    CdcSerial.write(XMODEM_EOT);
+    int resp = read_xmodem_response(3000);
+    if (resp == XMODEM_ACK) {
+      Serial.printf("[%s] EOT ACKed!\n", label);
+      return true;
+    }
+    delay_keep_alive(100);
+  }
+  return false;
+}
+
+//  VEGA PROGRAMMER: Official Two-Stage SPI Flash Routine (J12 SHORTED)
+bool flash_vega() {
+  if (progState == STATE_PROGRAMMING || progState == STATE_WAITING_FOR_BOOTLOADER) {
+    Serial.println("[WARN] Flash routine already in progress!");
+    return false;
+  }
+
+  progState = STATE_WAITING_FOR_BOOTLOADER;
+  Serial.println("\n==================================================");
+  Serial.println(" STARTING VEGA ARIES V2 OFFICIAL FLASHER PROGRAMMING");
+  Serial.println("==================================================");
+  Serial.println("[J12] Ensure Jumper J12 is SHORTED (Flash Mode).");
+
+  String appPath = find_app_bin();
+  if (appPath.length() == 0) {
+    Serial.println("[ERROR] No .bin in LittleFS - upload firmware via HTTP first!");
+    progState = STATE_FAILED_RETRY;
+    return false;
+  }
+
+  File appFile = LittleFS.open(appPath.c_str(), "r");
+  if (!appFile) {
+    Serial.println("[ERROR] Cannot open application .bin!");
+    progState = STATE_FAILED_RETRY;
+    return false;
+  }
+  size_t appSize = appFile.size();
+  Serial.printf("[APP] Application binary: %s (%u bytes)\n", appPath.c_str(), (unsigned)appSize);
+
+  // ------------------------------------------------------------------------
+  // STAGE 1: Wait for manual VEGA RESET & ROM Bootloader handshake
+  // ------------------------------------------------------------------------
+  purge_stale_rx();
+  Serial.println("[READY] Waiting for manual VEGA RESET");
+
+  bool got_rom_lt = false;
+  uint32_t t = millis();
+  while (millis() - t < 45000) { // Wait up to 45s for manual reset
+    server.handleClient();
+    int c = read_byte(200);
+    if (c == '<') {
+      got_rom_lt = true;
+      Serial.println("[BOOT] VEGA response: '<' received");
+      break;
+    }
+  }
+
+  if (!got_rom_lt) {
+    Serial.println("[ERROR] Manual RESET not detected (No '<' received). Check J12 is SHORTED and press RESET on VEGA.");
+    appFile.close();
+    progState = STATE_FAILED_RETRY;
+    return false;
+  }
+
+  Serial.println("[BOOT] Responding with '>' to ROM bootloader...");
+  CdcSerial.write('>');
+  delay_keep_alive(50);
+
+  // Wait for ROM bootloader XMODEM prompt 'C'
+  Serial.println("[BOOT] Waiting for ROM bootloader XMODEM prompt 'C'...");
+  bool got_rom_c = false;
+  t = millis();
+  while (millis() - t < 10000) {
+    server.handleClient();
+    int c = read_byte(200);
+    if (c == 'C') {
+      got_rom_c = true;
+      Serial.println("[BOOT] 'C' received from ROM bootloader");
+      break;
+    }
+  }
+
+  if (!got_rom_c) {
+    Serial.println("[ERROR] No 'C' prompt from ROM bootloader!");
+    appFile.close();
+    progState = STATE_FAILED_RETRY;
+    return false;
+  }
+
+  // Send flasher.bin to ROM Bootloader via XMODEM-CRC
+  Serial.println("[FLASHER] Sending flasher.bin");
+  progState = STATE_PROGRAMMING;
+
+  bool flasherSent = send_xmodem_buffer(flasher_min_bin, sizeof(flasher_min_bin), "FLASHER");
+  if (!flasherSent) {
+    Serial.println("[ERROR] Failed to send flasher.bin!");
+    appFile.close();
+    progState = STATE_FAILED_RETRY;
+    return false;
+  }
+
+  Serial.println("[FLASHER] flasher.bin transfer complete! Waiting for VEGA FLASHER to boot in RAM...");
+  delay_keep_alive(500);
+
+  // STAGE 2: VEGA FLASHER handshake & external SPI Flash erase
+  Serial.println("[FLASHER] Waiting for VEGA FLASHER handshake '<'...");
+  bool got_flasher_lt = false;
+  t = millis();
+  while (millis() - t < 15000) {
+    server.handleClient();
+    int c = read_byte(200);
+    if (c == '<') {
+      got_flasher_lt = true;
+      Serial.println("[FLASHER] Handshake '<' received from flasher.bin");
+      break;
+    }
+  }
+
+  if (!got_flasher_lt) {
+    Serial.println("[ERROR] No handshake from flasher.bin!");
+    appFile.close();
+    progState = STATE_FAILED_RETRY;
+    return false;
+  }
+
+  Serial.println("[FLASHER] Responding with '>' to flasher.bin...");
+  CdcSerial.write('>');
+  delay_keep_alive(50);
+
+  Serial.println("[FLASHER] External SPI Flash erase/program operation");
+
+  // STAGE 3: Wait for 'C' from flasher.bin and send application BIN
+  Serial.println("[FLASHER] Waiting for application");
+  bool got_app_c = false;
+  t = millis();
+  while (millis() - t < 15000) { // Allow up to 15s for SPI erase + 'C' prompt
+    server.handleClient();
+    int c = read_byte(200);
+    if (c == 'C') {
+      got_app_c = true;
+      Serial.println("[FLASHER] 'C' received - VEGA FLASHER ready for application binary");
+      break;
+    }
+  }
+
+  if (!got_app_c) {
+    Serial.println("[ERROR] No 'C' prompt from VEGA FLASHER after erase!");
+    appFile.close();
+    progState = STATE_FAILED_RETRY;
+    return false;
+  }
+
+  Serial.println("[APP] Sending application BIN");
+  bool appSent = send_xmodem_file(appFile, appSize, "APP");
+  appFile.close();
+
+  if (!appSent) {
+    Serial.println("[ERROR] Failed to send application BIN!");
+    progState = STATE_FAILED_RETRY;
+    return false;
+  }
+
+  // STAGE 4: Verification & Auto-Boot
+  Serial.println("[VERIFY] Magic header written to SPI Flash (0x40000) & verified by VEGA FLASHER");
+  delay_keep_alive(1000);
+
+  Serial.println("==================================================");
+  Serial.println("[SUCCESS] Permanent programming completed");
+  Serial.println("VEGA application is permanently stored in SPI Flash!");
+  Serial.println("==================================================");
+
+  progState = STATE_SUCCESS;
+  return true;
+}
+
+//  SETUP
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("\n==================================================");
+  Serial.println("  ESP32-S3 -> VEGA ARIES v2  |  Official Flasher Gateway");
+  Serial.println("==================================================");
+
+  // LittleFS
+  if (!LittleFS.begin(true)) {
+    Serial.println("[FATAL] LittleFS mount failed!");
+  } else {
+    Serial.printf("[FS] LittleFS mounted. Total: %u KB  Used: %u KB\n",
+                  (unsigned)(LittleFS.totalBytes() / 1024),
+                  (unsigned)(LittleFS.usedBytes()  / 1024));
+    File root = LittleFS.open("/");
+    File f    = root.openNextFile();
+    while (f) {
+      Serial.printf("  %s  (%u bytes)\n", f.name(), (unsigned)f.size());
+      f = root.openNextFile();
+    }
+    // Pre-cache firmware info so GET /status doesn't block computing SHA-256 on flash
+    updateCachedFirmwareInfo();
+  }
+
+  wm.setCustomHeadElement(custom_head_html);
+  wm.setTitle("VEGA ARISE EDU - ARIES V2 PROGRAMMER");
+  wm.setConnectTimeout(15);
+  wm.setConfigPortalTimeout(180);
+  wm.setCaptivePortalEnable(true);
+  wm.setShowStaticFields(false);
+  wm.setShowInfoUpdate(false);
+  wm.setShowInfoErase(false);
+ 
+  bool connected = wm.autoConnect(PORTAL_AP_SSID);
+
+  if (connected && WiFi.status() == WL_CONNECTED) {
+    Serial.println("[WiFi] Connected");
+    Serial.print("[WiFi] IP: http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("[WiFi] Could not connect. Running fallback AP mode...");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(PORTAL_AP_SSID);
+    Serial.print("[WiFi AP] Fallback AP IP: http://");
+    Serial.println(WiFi.softAPIP());
+  }
+
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+
+  const char* headerKeys[] = {
+    "X-Expected-Size",
+    "X-Expected-Checksum",
+    "Access-Control-Request-Private-Network",
+    "Access-Control-Request-Method",
+    "Access-Control-Request-Headers",
+    "Origin"
+  };
+  size_t headerKeyCount = sizeof(headerKeys) / sizeof(char*);
+  server.collectHeaders(headerKeys, headerKeyCount);
+
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/status", HTTP_OPTIONS, handleOptions);
+  server.on("/upload", HTTP_OPTIONS, handleOptions);
+  server.on("/upload", HTTP_POST, handleUploadResponse, handleUploadStream);
+
+  server.on("/changewifi", HTTP_GET, []() {
+    setCorsHeaders();
+    wifiChangeRequested = true;
+    const char* html =
+      "<!DOCTYPE html><html><head>"
+      "<meta charset='UTF-8'>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>Changing Wi-Fi &mdash; VEGA ARISE EDU</title>"
+      "<style>"
+        "body{background:#060b14;color:#f0f6ff;font-family:'Inter',-apple-system,sans-serif;"
+          "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}"
+        ".box{background:#111827;border:1px solid #1e2d45;border-radius:20px;"
+          "padding:40px 32px;max-width:380px;width:100%;text-align:center;"
+          "box-shadow:0 20px 60px rgba(0,0,0,0.7);}"
+        ".chip{display:inline-block;background:rgba(14,165,233,0.12);"
+          "border:1px solid rgba(56,189,248,0.3);color:#38bdf8;"
+          "font-size:0.7rem;font-weight:700;padding:5px 14px;"
+          "border-radius:100px;letter-spacing:1px;text-transform:uppercase;margin-bottom:18px;}"
+        ".spinner{display:inline-block;width:28px;height:28px;"
+          "border:3px solid rgba(56,189,248,0.2);border-top-color:#38bdf8;"
+          "border-radius:50%;animation:spin 0.8s linear infinite;margin-bottom:14px;}"
+        "@keyframes spin{to{transform:rotate(360deg);}}"
+        "h2{font-size:1.25rem;font-weight:800;margin-bottom:10px;color:#38bdf8;}"
+        "p{font-size:0.88rem;color:#7a93b4;line-height:1.6;margin-bottom:10px;}"
+      "</style></head><body>"
+      "<div class='box'>"
+        "<div class='chip'>VEGA ARISE EDU</div><br>"
+        "<div class='spinner'></div>"
+        "<h2>Opening Wi-Fi Setup&hellip;</h2>"
+        "<p>Saved credentials will be cleared.<br>"
+        "Connect your device to the<br><strong>VEGA-PROGRAMMER</strong> Wi-Fi network,<br>"
+        "then choose your new network.</p>"
+        "<p style='font-size:0.78rem;color:#4a6080;'>AP IP: 192.168.4.1</p>"
+      "</div></body></html>";
+    server.send(200, "text/html", html);
+    Serial.println("[WiFi] User requested CHANGE WI-FI. Portal will open shortly.");
+  });
+  server.on("/changewifi", HTTP_OPTIONS, handleOptions);
+
+  server.on("/wifiinfo", HTTP_GET, []() {
+    setCorsHeaders();
+    String ssid = (WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : "";
+    String ip   = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
+    String json = "{";
+    json += "\"connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+    json += "\"ssid\":\""   + ssid + "\",";
+    json += "\"ip\":\""     + ip   + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+  server.on("/wifiinfo", HTTP_OPTIONS, handleOptions);
+
+  server.onNotFound([]() {
+    setCorsHeaders();
+    if (server.method() == HTTP_OPTIONS) {
+      server.send(204);
+    } else {
+      server.send(404, "application/json", "{\"error\":\"Route not found\"}");
+    }
+  });
+  server.begin();
+  Serial.println("[HTTP] Server on port 80 ready.");
+
+  usb.onDeviceConnected([](const EspUsbHostDeviceInfo& dev) {
+    Serial.printf("[USB] Device attached: VID=%04X PID=%04X (%s)\n",
+                  dev.vid, dev.pid, dev.product);
+    if (dev.vid == 0x0403 && dev.pid == 0x6015) {
+      Serial.println("[USB] FT230X detected - Enumeration successful");
+      isDeviceConnected = true;
+      progState         = STATE_DEVICE_CONNECTED;
+      connectTime       = millis();
+    }
+  });
+
+  usb.onDeviceDisconnected([](const EspUsbHostDeviceInfo& dev) {
+    Serial.println("[USB] FT230X Disconnected.");
+    isDeviceConnected = false;
+    flashDone         = false;  // allow re-flash on next connect/trigger
+    progState         = STATE_IDLE;
+    if (usbHostState == USB_HOST_RUNNING) triggerUsbRecovery();
+  });
+
+  // Settling delay before initial USB Host start (allows power rails and PHY to stabilize at boot)
+  delay(500);
+  startUsbHost();
+
+  Serial.println("\n[READY] Upload .bin via POST /upload, then press manual VEGA RESET button.");
+}
+
+//  MAIN LOOP
+void loop() {
+  server.handleClient();  // Keep HTTP WebServer alive
+
+  // ── Intentional CHANGE WI-FI: user pressed the button ────────────────────
+  // Process the flag here (main task) rather than inside the HTTP handler
+  // because WiFiManager's startConfigPortal() must run from the main task.
+  if (wifiChangeRequested) {
+    wifiChangeRequested = false;
+    Serial.println("[WiFi] CHANGE WI-FI requested by user.");
+    Serial.println("[WiFi] Erasing saved credentials and opening config portal...");
+
+    // Erase only when the user explicitly requests a change.
+    wm.resetSettings();
+    WiFi.disconnect(true);  // disconnect + erase NVS WiFi credentials
+    delay(200);
+
+    // Re-apply portal settings (they survive resetSettings on the wm object)
+    wm.setCustomHeadElement(custom_head_html);
+    wm.setTitle("VEGA ARISE EDU - ARIES V2 PROGRAMMER");
+    wm.setConnectTimeout(30);
+    wm.setConfigPortalTimeout(300);  // 5 min portal timeout for intentional change
+    wm.setCaptivePortalEnable(true);
+    wm.setShowStaticFields(false);
+    wm.setShowInfoUpdate(false);
+    wm.setShowInfoErase(false);
+
+    Serial.printf("[WiFi] Starting VEGA-PROGRAMMER AP portal for CHANGE WI-FI...\n");
+    bool ok = wm.startConfigPortal(PORTAL_AP_SSID);
+    if (ok && WiFi.status() == WL_CONNECTED) {
+      Serial.println("[WiFi] Successfully connected to new network.");
+      Serial.print("[WiFi] IP: http://");
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println("[WiFi] Portal closed without connecting. Staying in current mode.");
+    }
+  }
+
+  // ── Wi-Fi Auto-reconnect safety check ────────────────────────────────────
+  // Handles temporary disconnections: reconnects using saved credentials
+  // without erasing them or opening the config portal.
+  if (WiFi.getMode() == WIFI_STA && WiFi.status() != WL_CONNECTED) {
+    static uint32_t lastWifiReconnectMs = 0;
+    if (millis() - lastWifiReconnectMs >= 5000) {
+      lastWifiReconnectMs = millis();
+      Serial.println("[WiFi] Connection lost. Reconnecting...");
+      WiFi.reconnect();
+    }
+  }
+
+  // State-based USB Host Enumeration Recovery (Non-blocking)
+  if (!isDeviceConnected && !flashDone) {
+    updateUsbHostRecovery();
+  }
+
+  // VEGA Flash Execution Condition
+  if (isDeviceConnected && !flashDone) {
+    if (progState == STATE_DEVICE_CONNECTED || progState == STATE_FAILED_RETRY) {
+      // Ensure USB CDC stack has settled after connection (1 second delay)
+      if (millis() - connectTime >= 1000) {
+        if (LittleFS.exists(FIRMWARE_FILE_PATH)) {
+          if (flash_vega()) {
+            flashDone = true;
+            progState = STATE_SUCCESS;
+            Serial.println("[MAIN] Permanent programming completed successfully");
+          } else {
+            progState = STATE_FAILED_RETRY;
+            Serial.println("[MAIN] Flashing failed. Retrying in 5 seconds...");
+            connectTime = millis() + 4000; // Wait 5s total (1s settling + 4s delay) non-blockingly
+          }
+        } else {
+          static uint32_t lastWaitMsgTime = 0;
+          if (millis() - lastWaitMsgTime >= 5000) {
+            lastWaitMsgTime = millis();
+            Serial.println("[WAIT] VEGA connected but no .bin in LittleFS yet.");
+            Serial.println("[WAIT] Upload firmware via POST /upload first.");
+          }
+        }
+      }
+    }
+  }
+
+  delay(1);
+}
