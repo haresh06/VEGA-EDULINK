@@ -1,102 +1,37 @@
 ﻿# VEGA EDULINK
 
-VEGA EDULINK is an educational embedded hardware and software platform built around the VEGA ARIES v2 / THEJAS32 ecosystem. The repository brings together hardware design resources, firmware, example code, documentation, and a local service used for toolchain and library management.
+VEGA EDULINK is a centralized repository for the development and documentation of the THEJAS32-based VEGA Trainer Kit. It contains technical documentation, firmware, example programs, hardware designs, schematics, trainer kit resources, and website assets.
 
-## Overview
+## 🌐 Website
 
-This project is designed to help learners and developers explore:
+**VEGA Studio IDE:** https://vega-web-ide.vercel.app/
 
-- embedded programming on VEGA-based hardware
-- firmware flashing and board programming workflows
-- Wi-Fi based provisioning and OTA-style board setup
-- GPIO, communication, interface experiments, and training activities
-- hardware documentation, schematics, footprints, and board references
+## Repository Structure
 
-## Features
+| Folder / File         | Description                                    |
+| --------------------- | ---------------------------------------------- |
+| `Docs/`               | Project documentation and technical references |
+| `Example code/`       | Example programs and demonstration codes       |
+| `Firmware/`           | THEJAS32-related firmware resources            |
+| `Footprint file/`     | PCB component footprint files                  |
+| `Schematics/`         | Hardware circuit schematics                    |
+| `Service/`            | Supporting service resources                   |
+| `Trainer kit Images/` | Trainer kit hardware images                    |
+| `Website images/`     | VEGA Studio website assets                     |
+| `COMMUNICATION`       | Communication trainer board images             |
+| `GPIO`                | GPIO trainer board images                      |
+| `Vega Flow`           | VEGA system workflow diagram                   |
+| `VEGA TRAINER KIT`    | Trainer kit overview and reference images      |
+| `Video Project 1`     | Project demonstration video                    |
 
-- Wi-Fi programming portal for device provisioning and firmware upload
-- ESP32-S3 receiver / flasher logic for external flash workflows
-- Node.js service for build toolchain and library resolution
-- support for hardware libraries such as SPI, Wire, LCD, and display modules
-- curated hardware assets, board schematics, and footprint files
-- sample programs, documentation, and kit reference materials
+## Project Overview
 
-## Repository structure
+The repository serves as a central resource for hardware development, firmware implementation, documentation, and learning resources associated with the VEGA EDULINK ecosystem.
 
-- `Firmware/` — firmware examples and board-side flashing logic
-- `Service/` — Node.js service used for toolchain/library integration
-- `Example code/` — starter code and practical examples
-- `Docs/` — datasheets, manuals, PPTs, and reference docs
-- `Schemtics/` — schematic and board design visuals
-- `Footprint file/` — PCB library resources for the VEGA ARIES v2
-- `Website images/` and `Trainer kit Images/` — visual assets for kits and training content
+## Processor
 
-## Hardware context
+**THEJAS32 – RISC-V Microprocessor**
 
-The project targets the VEGA ARIES v2 / THEJAS32 family and includes support for:
+## Purpose
 
-- GPIO experimentation
-- communication interfaces
-- SPI and I2C peripheral usage
-- flash programming workflows
-- embedded learning and trainer-kit use cases
-
-## Getting started
-
-### 1) Clone the repository
-
-```bash
-git clone https://github.com/haresh06/VEGA-EDULINK.git
-cd VEGA-EDULINK
-```
-
-### 2) Start the local service
-
-The `Service/server.js` file is a Node.js application that provides toolchain and library management. It expects dependencies such as `express`.
-
-```bash
-cd Service
-npm install express
-node server.js
-```
-
-### 3) Firmware setup
-
-The firmware in `Firmware/esp32_s3_receiver.ino` is intended for an ESP32-S3 receiver that can connect to a Wi-Fi portal and handle flashing workflows. Use the Arduino IDE or ESP32 board support package to build and upload it.
-
-Typical setup:
-
-- install ESP32 board support in Arduino IDE
-- select the correct ESP32-S3 board
-- open the firmware file from `Firmware/`
-- compile and upload it to the target board
-
-### 4) Programming workflow
-
-- power the board and connect to the `VEGA-PROGRAMMER` access point
-- upload a firmware binary through the captive portal
-- use the USB host + flash sequence described by the firmware when the compatible hardware is attached
-- follow the board-specific reset/jumper requirements if flashing from external SPI flash
-
-## Documentation
-
-The `Docs/` folder includes key reference material such as:
-
-- chip pinout information
-- datasheets
-- user manuals
-- training resources and presentation material
-
-## Notes
-
-- some components are intended for educational/training use
-- board-specific jumper and reset instructions should be checked against the official hardware documentation before flashing
-- schematics and footprint files are provided for reference and design study
-
-## License
-
-This repository does not currently include a project license file. If you plan to distribute or reuse it publicly, confirm the licensing terms with the project owner before commercial or redistributable use.
-
-## Contact / project origin
-
-This repository appears to be associated with a VEGA-based educational platform and trainer kit project. For exact ownership, licensing, and usage constraints, review the included documentation and repository metadata.
+To provide organized technical resources and development materials for the VEGA Trainer Kit and its embedded systems learning environment.
